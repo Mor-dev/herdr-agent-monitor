@@ -1,0 +1,13 @@
+{
+    "id": "herdrAgentMonitor",
+    "name": "herdr Agent Monitor",
+    "description": "Shows live agent status (working/idle/blocked/done) across herdr panes in the bar, click one to focus its pane",
+    "version": "1.0.0",
+    "author": "sysadmin",
+    "type": "widget",
+    "icon": "smart_toy",
+    "component": "./HerdrAgentMonitorWidget.qml",
+    "capabilities": ["dankbar-widget", "monitoring"],
+    "permissions": ["process"],
+    "dependencies": ["herdr"]
+}
