@@ -15,7 +15,26 @@ PluginComponent {
     // like rofi_plus's own herdrSessions widget, since env-var injection isn't exposed
     // through Proc.qml's runCommand() wrapper. Good enough for the common case (one
     // herdr instance running); extend later if multi-session turns out to matter.
-    property var agents: []
+    // Agent list, failure count and last-poll time are shared across every bar
+    // instance (one per monitor), so only one instance actually spawns
+    // `herdr agent list` per interval and the rest reuse its result.
+    PluginGlobalVar {
+        id: sharedAgents
+        varName: "agents"
+        defaultValue: []
+    }
+    PluginGlobalVar {
+        id: sharedFailures
+        varName: "consecutiveFailures"
+        defaultValue: 0
+    }
+    PluginGlobalVar {
+        id: sharedLastPoll
+        varName: "lastPollMs"
+        defaultValue: 0
+    }
+
+    readonly property var agents: sharedAgents.value
 
     // Proc is a pragma Singleton shared across every bar/screen instance, and its
     // debounce registry is keyed by the id passed to runCommand -- a fixed string
@@ -88,7 +107,22 @@ PluginComponent {
     // the moment a call succeeds again.
     readonly property int baseIntervalMs: 5000
     readonly property int maxIntervalMs: 60000
-    property int consecutiveFailures: 0
+    readonly property int maxBackoffSteps: 4
+    readonly property int currentIntervalMs: Math.min(baseIntervalMs * Math.pow(2, sharedFailures.value), maxIntervalMs)
+
+    function recordFailure() {
+        sharedAgents.set([]);
+        sharedFailures.set(Math.min(sharedFailures.value + 1, root.maxBackoffSteps));
+    }
+
+    function maybeRefresh() {
+        // 500 ms slack so this instance's own timer jitter doesn't make it skip itself.
+        const now = Date.now();
+        if (now - sharedLastPoll.value < root.currentIntervalMs - 500)
+            return;
+        sharedLastPoll.set(now);
+        root.refresh();
+    }
 
     function refresh() {
         // `herdr agent list` has no --json flag of its own (its help text lists no options at
@@ -98,17 +132,15 @@ PluginComponent {
         // resilient fix regardless of why, since the bare command reliably returns the same JSON.
         Proc.runCommand("herdrAgentMonitor.refresh." + root.instanceId, ["herdr", "agent", "list"], (stdout, exitCode) => {
             if (exitCode !== 0) {
-                root.agents = [];
-                root.consecutiveFailures++;
+                root.recordFailure();
                 return;
             }
             try {
                 const data = JSON.parse(stdout);
-                root.agents = (data.result && data.result.agents) || [];
-                root.consecutiveFailures = 0;
+                sharedAgents.set((data.result && data.result.agents) || []);
+                sharedFailures.set(0);
             } catch (e) {
-                root.agents = [];
-                root.consecutiveFailures++;
+                root.recordFailure();
             }
         });
     }
@@ -118,11 +150,11 @@ PluginComponent {
     }
 
     Timer {
-        interval: Math.min(root.baseIntervalMs * Math.pow(2, root.consecutiveFailures), root.maxIntervalMs)
+        interval: root.currentIntervalMs
         running: true
         repeat: true
         triggeredOnStart: true
-        onTriggered: root.refresh()
+        onTriggered: root.maybeRefresh()
     }
 
     popoutWidth: 340
@@ -206,6 +238,7 @@ PluginComponent {
                             spacing: Theme.spacingS
 
                             DankIcon {
+                                id: statusIconItem
                                 name: root.statusIcon(modelData.agent_status)
                                 color: root.statusColor(modelData.agent_status)
                                 size: Theme.iconSizeSmall
@@ -213,16 +246,21 @@ PluginComponent {
                             }
 
                             Column {
+                                width: row.width - statusIconItem.width - row.spacing
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 2
 
                                 StyledText {
+                                    width: parent.width
+                                    elide: Text.ElideRight
                                     text: modelData.terminal_title_stripped || modelData.agent
                                     color: Theme.surfaceText
                                     font.pixelSize: Theme.fontSizeMedium
                                 }
 
                                 StyledText {
+                                    width: parent.width
+                                    elide: Text.ElideMiddle
                                     text: root.shortCwd(modelData.cwd) + "  ·  " + modelData.agent_status
                                     color: Theme.surfaceText
                                     opacity: 0.7

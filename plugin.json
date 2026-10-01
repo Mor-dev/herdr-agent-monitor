@@ -2,7 +2,7 @@
     "id": "herdrAgentMonitor",
     "name": "herdr Agent Monitor",
     "description": "Shows live agent status (working/idle/blocked/done) across herdr panes in the bar, click one to focus its pane",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "author": "Mor-dev",
     "type": "widget",
     "icon": "smart_toy",
