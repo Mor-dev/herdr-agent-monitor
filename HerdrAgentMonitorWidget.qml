@@ -82,6 +82,14 @@ PluginComponent {
         return statusColor(best.agent_status);
     }
 
+    // Backs off when `herdr` is missing/not running so a dead binary doesn't get
+    // re-spawned forever at the base rate -- doubles the poll interval per
+    // consecutive failure, capped at maxIntervalMs, and resets to baseIntervalMs
+    // the moment a call succeeds again.
+    readonly property int baseIntervalMs: 5000
+    readonly property int maxIntervalMs: 60000
+    property int consecutiveFailures: 0
+
     function refresh() {
         // `herdr agent list` has no --json flag of its own (its help text lists no options at
         // all, unlike `session list`) -- JSON is its unconditional default output. Passing --json
@@ -91,13 +99,16 @@ PluginComponent {
         Proc.runCommand("herdrAgentMonitor.refresh." + root.instanceId, ["herdr", "agent", "list"], (stdout, exitCode) => {
             if (exitCode !== 0) {
                 root.agents = [];
+                root.consecutiveFailures++;
                 return;
             }
             try {
                 const data = JSON.parse(stdout);
                 root.agents = (data.result && data.result.agents) || [];
+                root.consecutiveFailures = 0;
             } catch (e) {
                 root.agents = [];
+                root.consecutiveFailures++;
             }
         });
     }
@@ -107,7 +118,7 @@ PluginComponent {
     }
 
     Timer {
-        interval: 3000
+        interval: Math.min(root.baseIntervalMs * Math.pow(2, root.consecutiveFailures), root.maxIntervalMs)
         running: true
         repeat: true
         triggeredOnStart: true
