@@ -90,15 +90,15 @@ PluginComponent {
         return list;
     }
 
-    readonly property color worstStateColor: {
+    // Neutral with no agents, primary (like other "active" bar pills) once any exist,
+    // and error only when one is blocked waiting on you. Idle agents are the normal
+    // state, so they deliberately don't get the warning color here.
+    readonly property color barIconColor: {
         if (root.agents.length === 0)
-            return Theme.surfaceText;
-        let best = root.agents[0];
-        for (const a of root.agents) {
-            if (statusPriority(a.agent_status) < statusPriority(best.agent_status))
-                best = a;
-        }
-        return statusColor(best.agent_status);
+            return Theme.widgetIconColor;
+        if (root.agents.some(a => a.agent_status === "blocked"))
+            return Theme.error;
+        return Theme.primary;
     }
 
     // Backs off when `herdr` is missing/not running so a dead binary doesn't get
@@ -166,7 +166,7 @@ PluginComponent {
 
             DankIcon {
                 name: "smart_toy"
-                color: root.worstStateColor
+                color: root.barIconColor
                 size: Theme.barIconSize(root.barThickness, -4)
                 anchors.verticalCenter: parent.verticalCenter
             }
@@ -187,7 +187,7 @@ PluginComponent {
 
             DankIcon {
                 name: "smart_toy"
-                color: root.worstStateColor
+                color: root.barIconColor
                 size: Theme.barIconSize(root.barThickness, -4)
                 anchors.horizontalCenter: parent.horizontalCenter
             }
