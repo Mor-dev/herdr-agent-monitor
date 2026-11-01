@@ -8,7 +8,7 @@ PluginComponent {
     id: root
     property var popoutService: null
 
-    // Fully self-contained -- calls the `herdr` CLI directly (no rofi_plus/personal-
+    // Fully self-contained -- calls the `herdr` and `hc` CLIs directly (no rofi_plus/personal-
     // script dependency), so this is safe to publish/install standalone. Scoped to
     // this machine's single local herdr session (whichever `herdr agent list --json`
     // targets with no --session/HERDR_SOCKET_PATH given) -- not multi-session-aware
@@ -124,29 +124,64 @@ PluginComponent {
         root.refresh();
     }
 
+    // Both parsers return null on failure so refresh() can tell "answered with no
+    // agents" apart from "not running".
+    function parseHerdr(stdout) {
+        try {
+            const data = JSON.parse(stdout);
+            return ((data.result && data.result.agents) || []).map(a => Object.assign({ backend: "herdr" }, a));
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // The Herdr desktop app runs its terminals in herdr-core (`hc`). A terminal is an
+    // agent only when its program reports a status; plain shells have none.
+    // Mapped onto `herdr agent list`'s field names so the UI handles both alike.
+    function parseHc(stdout) {
+        try {
+            const data = JSON.parse(stdout);
+            return (data.terminals || []).filter(t => t.status).map(t => ({
+                backend: "hc",
+                pane_id: t.address,
+                agent: t.agent,
+                agent_status: t.status,
+                cwd: t.cwd,
+                terminal_title_stripped: t.where
+            }));
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Queries both herdr (the terminal multiplexer) and the Herdr desktop app, and
+    // merges whichever answers -- people may run either or both. It only counts
+    // as a failure for backoff when neither does.
     function refresh() {
-        // `herdr agent list` has no --json flag of its own (its help text lists no options at
-        // all, unlike `session list`) -- JSON is its unconditional default output. Passing --json
-        // anyway worked inconsistently in testing (succeeded once, then failed with a usage error
-        // on an identical later call, cause not pinned down) -- dropping the flag entirely is the
-        // resilient fix regardless of why, since the bare command reliably returns the same JSON.
-        Proc.runCommand("herdrAgentMonitor.refresh." + root.instanceId, ["herdr", "agent", "list"], (stdout, exitCode) => {
-            if (exitCode !== 0) {
-                root.recordFailure();
-                return;
-            }
-            try {
-                const data = JSON.parse(stdout);
-                sharedAgents.set((data.result && data.result.agents) || []);
+        Proc.runCommand("herdrAgentMonitor.hc." + root.instanceId, ["hc", "ls", "--json"], (hcOut, hcExit) => {
+            const hcAgents = hcExit === 0 ? root.parseHc(hcOut) : null;
+            // `herdr agent list` has no --json flag of its own (its help text lists no options at
+            // all, unlike `session list`) -- JSON is its unconditional default output. Passing --json
+            // anyway worked inconsistently in testing (succeeded once, then failed with a usage error
+            // on an identical later call, cause not pinned down) -- dropping the flag entirely is the
+            // resilient fix regardless of why, since the bare command reliably returns the same JSON.
+            Proc.runCommand("herdrAgentMonitor.refresh." + root.instanceId, ["herdr", "agent", "list"], (stdout, exitCode) => {
+                const herdrAgents = exitCode === 0 ? root.parseHerdr(stdout) : null;
+                if (hcAgents === null && herdrAgents === null) {
+                    root.recordFailure();
+                    return;
+                }
+                sharedAgents.set((hcAgents || []).concat(herdrAgents || []));
                 sharedFailures.set(0);
-            } catch (e) {
-                root.recordFailure();
-            }
+            });
         });
     }
 
-    function focusAgent(paneId) {
-        Quickshell.execDetached(["herdr", "agent", "focus", paneId]);
+    function focusAgent(agent) {
+        if (agent.backend === "hc")
+            Quickshell.execDetached(["herdr-app", "do", "agent.focus", "--terminal", agent.pane_id]);
+        else
+            Quickshell.execDetached(["herdr", "agent", "focus", agent.pane_id]);
     }
 
     Timer {
@@ -274,7 +309,7 @@ PluginComponent {
                             anchors.fill: parent
                             hoverEnabled: true
                             onClicked: {
-                                root.focusAgent(modelData.pane_id);
+                                root.focusAgent(modelData);
                                 popout.closePopout();
                             }
                         }

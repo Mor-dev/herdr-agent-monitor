@@ -1,18 +1,20 @@
 # herdr Agent Monitor
 
 A [DankMaterialShell](https://danklinux.com) bar widget that shows live agent status from
-[herdr](https://herdr.dev) — the agent-aware terminal multiplexer for Claude Code and similar
-coding agents.
+[herdr](https://herdr.dev), the agent-aware terminal multiplexer for Claude Code and similar
+coding agents, and from the Herdr desktop app (`herdr-app`).
 
 ## What it does
 
-- Bar pill: a count of active herdr agents, with an icon colored by the most urgent status
-  present (blocked → error, idle → warning, working → primary, done → success).
+- Bar pill: a count of active agents. The icon is neutral with no agents, primary once any
+  exist, and error when one is blocked waiting on you.
 - Popout: every agent's title, working directory, and status, sorted most-urgent-first.
-- Click an agent to focus its pane (`herdr agent focus <pane_id>`).
+- Click an agent to focus it (`herdr agent focus <pane_id>`, or
+  `herdr-app do agent.focus --terminal <address>` for Herdr app agents).
 
-Calls the `herdr` CLI directly — no other dependency, no bundled scripts, nothing to configure.
-Requires `herdr` installed and its server running (`herdr` with no session flags starts one).
+Calls the `herdr` and `hc` (herdr-core, which runs the Herdr app's terminals) CLIs directly, with
+no other dependency, no bundled scripts, and nothing to configure. Works with either one running,
+or both; agents from both are listed together.
 
 Scoped to this machine's single local herdr session — not multi-session-aware, since injecting a
 per-call `HERDR_SOCKET_PATH` isn't exposed through Quickshell's `Proc.qml` wrapper. Fine for the
