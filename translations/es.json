@@ -1,6 +1,6 @@
 {
-  "herdr Agent Monitor": {
-    "herdr Agent Monitor": "herdr Agent Monitor"
+  "Herdr Agent Monitor": {
+    "Herdr Agent Monitor": "Herdr Agent Monitor"
   },
   "%1 agents · %2 spaces · %3/%4 hosts": {
     "%1 agents · %2 spaces · %3/%4 hosts": "%1 agentes · %2 spaces · %3/%4 hosts"
@@ -53,6 +53,15 @@
   "No active agents across monitored machines": {
     "No active agents across monitored machines": "No hay agentes activos en las máquinas monitoreadas"
   },
+  "No active agents on this machine": {
+    "No active agents on this machine": "No hay agentes activos en esta máquina"
+  },
+  "Search agents, spaces, machines, cwd…": {
+    "Search agents, spaces, machines, cwd…": "Buscar agentes, spaces, máquinas, ruta…"
+  },
+  "No agents match \"%1\"": {
+    "No agents match \"%1\"": "Ningún agente coincide con \"%1\""
+  },
   "Monitors herdr agents and workspaces across your local machine, remote SSH machines (`herdr machine list`), and optionally the Herdr Desktop App (`hc` / `herdr-core`). Left-click opens the popout, right-click refreshes, middle-click focuses the herdr window.": {
     "Monitors herdr agents and workspaces across your local machine, remote SSH machines (`herdr machine list`), and optionally the Herdr Desktop App (`hc` / `herdr-core`). Left-click opens the popout, right-click refreshes, middle-click focuses the herdr window.": "Supervisa agentes y spaces de herdr en tu máquina local, máquinas remotas por SSH (`herdr machine list`) y opcionalmente la nueva Herdr Desktop App (`hc` / `herdr-core`). Clic izquierdo abre el panel, clic derecho refresca, clic medio enfoca la ventana de herdr."
   },
@@ -65,8 +74,8 @@
   "Include Herdr Desktop App (hc)": {
     "Include Herdr Desktop App (hc)": "Incluir Herdr Desktop App (hc)"
   },
-  "Queries `hc ls --json` (`herdr-core`) to include terminals from the graphical desktop app": {
-    "Queries `hc ls --json` (`herdr-core`) to include terminals from the graphical desktop app": "Consulta también `hc ls --json` (`herdr-core`) para mostrar las terminales de la app gráfica de escritorio"
+  "Queries `herdr-app ls`, `herdr-core` state, and `hc ls --json` across local and remote `hc` machines": {
+    "Queries `herdr-app ls`, `herdr-core` state, and `hc ls --json` across local and remote `hc` machines": "Consulta `herdr-app ls`, el estado de `herdr-core` y `hc ls --json` en máquinas `hc` locales y remotas"
   },
   "Show spaces without active agents": {
     "Show spaces without active agents": "Mostrar spaces sin agentes activos"

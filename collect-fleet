@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel multi-machine & workspace collector for herdr Agent Monitor (herdrAgentMonitor).
+"""Parallel multi-machine & workspace collector for Dux Herdr Fleet (duxHerdrFleet).
 
 Queries local `herdr api snapshot`, all enabled SSH machines from `herdr machine list`,
 and optionally `hc ls --json` (Herdr Desktop App / herdr-core), returning a single
@@ -273,95 +273,429 @@ def fetch_machine(
     return parse_herdr_snapshot(machine, data, home, include_empty_spaces)
 
 
-def fetch_hc(timeout: float, home: str) -> dict[str, Any] | None:
-    data = run_json_cmd(["hc", "ls", "--json"], timeout=timeout)
-    if data is None:
-        return None
+def strip_agent_title(raw: str) -> str:
+    text = (raw or "").strip()
+    while text and text[0] in ("✳", "⏳", "✔", "●", "•", "▪", "▫"):
+        text = text[1:].strip()
+    return text
 
-    raw_terminals = [t for t in (data.get("terminals") or []) if t.get("status")]
-    seen_addrs: set[str] = set()
-    terminals: list[dict[str, Any]] = []
-    for idx, t in enumerate(raw_terminals, start=1):
-        addr = str(t.get("address") or f"t{idx}").strip()
-        if addr in seen_addrs:
-            continue
-        seen_addrs.add(addr)
-        terminals.append(t)
 
-    counts = {"total": 0, "blocked": 0, "working": 0, "idle": 0, "done": 0, "unknown": 0}
-    agents = []
+def load_hc_local_state(home: str) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Read herdr-core local state files (~/.local/state/herdr-core/default/{terminals,machines}.json)
+    for instant (<1ms) terminal titles, status messages, and configured hc machines."""
+    if not home:
+        return {}, []
+    base = os.path.join(home, ".local", "state", "herdr-core", "default")
+    terms_by_addr: dict[str, dict[str, Any]] = {}
+    machines_list: list[dict[str, Any]] = []
 
-    for idx, t in enumerate(terminals, start=1):
-        status = (t.get("status") or "unknown").lower()
-        if status not in counts:
-            status = "unknown"
-        counts["total"] += 1
-        counts[status] += 1
+    terms_path = os.path.join(base, "terminals.json")
+    if os.path.isfile(terms_path):
+        try:
+            with open(terms_path, "r", encoding="utf-8") as fh:
+                tdata = json.load(fh)
+            raw_terms = tdata.get("terminals") if isinstance(tdata, dict) else None
+            items_iter = (
+                raw_terms.values()
+                if isinstance(raw_terms, dict)
+                else (raw_terms if isinstance(raw_terms, list) else [])
+            )
+            for item in items_iter:
+                if not isinstance(item, dict):
+                    continue
+                addr = str(item.get("address") or item.get("id") or "").strip()
+                if item.get("state") == "live" and addr:
+                    terms_by_addr[addr] = item
+        except (OSError, json.JSONDecodeError):
+            pass
 
-        addr = t.get("address") or f"t{idx}"
-        where = (t.get("where") or addr).strip()
-        agent_name = t.get("agent") or "agent"
-        cwd = shorten_cwd(t.get("cwd") or "", home)
+    machines_path = os.path.join(base, "machines.json")
+    if os.path.isfile(machines_path):
+        try:
+            with open(machines_path, "r", encoding="utf-8") as fh:
+                mdata = json.load(fh)
+            if isinstance(mdata, list):
+                machines_list = [m for m in mdata if isinstance(m, dict) and m.get("name")]
+        except (OSError, json.JSONDecodeError):
+            pass
 
-        agents.append(
-            {
-                "key": f"hc:hc:{addr}",
-                "backend": "hc",
-                "machine_id": "hc",
-                "machine_label": "Herdr App (hc)",
-                "machine_short": "hc",
-                "is_local": True,
-                "workspace_id": "hc-app",
-                "workspace_number": 1,
-                "workspace_label": "Herdr Desktop App",
-                "tab_id": "",
-                "pane_id": addr,
-                "agent": agent_name,
-                "agent_status": status,
-                "title": where,
-                "subtitle": agent_name,
-                "cwd": cwd,
-                "context": f"turn {t.get('turn')}" if t.get("turn") is not None else "",
-                "limit": "",
-                "cache": "",
-                "focused": False,
-            }
-        )
+    return terms_by_addr, machines_list
 
-    agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
 
-    workspaces = []
-    if agents:
-        workspaces.append(
-            {
-                "workspace_id": "hc-app",
-                "number": 1,
-                "label": "Herdr Desktop App (herdr-core)",
-                "focused": False,
-                "pane_count": len(agents),
-                "tab_count": 1,
-                "agent_status": agents[0]["agent_status"],
-                "agents": agents,
-            }
-        )
+def fetch_hc_machines(
+    timeout: float,
+    home: str,
+    include_remote: bool,
+    include_empty_spaces: bool,
+) -> list[dict[str, Any]]:
+    terms_meta, state_machines = load_hc_local_state(home)
 
-    return {
-        "id": "hc",
-        "label": "Herdr App (hc)",
-        "short_label": "hc",
-        "target": "local",
-        "session": "default",
-        "isLocal": True,
-        "backend": "hc",
-        "reachable": True,
-        "counts": counts,
-        "workspaces": workspaces,
+    # 1. Fast query to herdr-app ls (~4ms when window is open) for exact spaces & remote panes
+    app_data = run_json_cmd(["herdr-app", "ls"], timeout=1.5)
+
+    # 2. Query hc ls --json when remote polling is requested or when neither app_data nor local state is available.
+    #    hc ls --json can take ~3.0s when remote hc machines are configured, so give it at least 5.0s.
+    hc_data = None
+    if include_remote or (app_data is None and not terms_meta):
+        hc_data = run_json_cmd(["hc", "ls", "--json"], timeout=max(5.0, timeout + 1.5))
+
+    if app_data is None and hc_data is None and not terms_meta and not state_machines:
+        return []
+
+    # Build configured hc machines map: "local" + remote machines from machines.json / hc ls / herdr-app ls
+    hc_hosts_order: list[str] = ["local"]
+    hc_host_info: dict[str, dict[str, Any]] = {
+        "local": {
+            "host": "local",
+            "id": "hc:local",
+            "short_label": "hc · local",
+            "label": "Herdr App · local",
+            "target": "local",
+            "isLocal": True,
+            "reachable": True,
+        }
     }
+
+    seen_targets: set[str] = set()
+    for m in state_machines:
+        name = str(m.get("name") or "").strip()
+        if not name or name == "local":
+            continue
+        target = str(m.get("target") or m.get("host") or name).strip()
+        canon = target.lower()
+        if canon in seen_targets:
+            continue
+        seen_targets.add(canon)
+        if name not in hc_host_info:
+            hc_hosts_order.append(name)
+            hc_host_info[name] = {
+                "host": name,
+                "id": f"hc:{name}",
+                "short_label": f"hc · {name}",
+                "label": f"Herdr App · {name}" + (f" ({target})" if target and target != name else ""),
+                "target": target,
+                "isLocal": False,
+                "reachable": True,
+            }
+
+    if hc_data and isinstance(hc_data.get("machines"), list):
+        for m in hc_data["machines"]:
+            name = str(m.get("name") or "").strip()
+            if not name or name == "local":
+                continue
+            state = str(m.get("state") or "").lower()
+            reachable = state in ("connected", "ready", "ok", "")
+            if name not in hc_host_info:
+                hc_hosts_order.append(name)
+                hc_host_info[name] = {
+                    "host": name,
+                    "id": f"hc:{name}",
+                    "short_label": f"hc · {name}",
+                    "label": f"Herdr App · {name}",
+                    "target": name,
+                    "isLocal": False,
+                    "reachable": reachable,
+                }
+            else:
+                hc_host_info[name]["reachable"] = reachable
+
+    # Merge terminal info by address from terminals.json and hc ls --json
+    merged_terms: dict[str, dict[str, Any]] = {}
+    for addr, item in terms_meta.items():
+        st_obj = item.get("status")
+        st_state = st_obj.get("state") if isinstance(st_obj, dict) else (st_obj if isinstance(st_obj, str) else None)
+        st_app = st_obj.get("app") if isinstance(st_obj, dict) else None
+        st_msg = st_obj.get("msg") if isinstance(st_obj, dict) else None
+        labels = item.get("labels") or {}
+        merged_terms[addr] = {
+            "address": addr,
+            "agent": st_app or item.get("agent") or "",
+            "status": str(st_state).lower() if st_state else "",
+            "title": str(item.get("title") or "").strip(),
+            "msg": str(st_msg or "").strip(),
+            "cwd": str(item.get("cwd") or ""),
+            "turn": item.get("turn"),
+            "where": str(labels.get("where") or "").strip(),
+            "space_id": str(labels.get("herdr.space") or "").strip(),
+        }
+
+    if hc_data and isinstance(hc_data.get("terminals"), list):
+        for t in hc_data["terminals"]:
+            addr = str(t.get("address") or "").strip()
+            if not addr:
+                continue
+            existing = merged_terms.get(addr, {})
+            st_val = t.get("status")
+            if isinstance(st_val, dict):
+                st_str = str(st_val.get("state") or "").lower()
+                app_str = str(st_val.get("app") or "")
+            else:
+                st_str = str(st_val or "").lower()
+                app_str = str(t.get("agent") or "")
+            merged_terms[addr] = {
+                "address": addr,
+                "agent": app_str or existing.get("agent") or "",
+                "status": st_str or existing.get("status") or "",
+                "title": existing.get("title") or str(t.get("title") or "").strip(),
+                "msg": existing.get("msg") or "",
+                "cwd": str(t.get("cwd") or existing.get("cwd") or ""),
+                "turn": t.get("turn") if t.get("turn") is not None else existing.get("turn"),
+                "where": str(t.get("where") or existing.get("where") or "").strip(),
+                "space_id": existing.get("space_id") or "",
+            }
+
+    # If herdr-app ls reports remote terminals not in local terminals.json, fetch their metadata via hc get
+    if app_data and isinstance(app_data.get("spaces"), list):
+        missing_remote_addrs: list[str] = []
+        for sp in app_data["spaces"]:
+            if not isinstance(sp, dict):
+                continue
+            for tab in sp.get("tabs") or []:
+                for term_entry in tab.get("terminals") or []:
+                    addr = str(term_entry.get("terminal") or "").strip()
+                    if addr and "/" in addr and addr not in merged_terms:
+                        missing_remote_addrs.append(addr)
+        for addr in missing_remote_addrs:
+            t_detail = run_json_cmd(["hc", "get", addr, "--json"], timeout=1.0)
+            if isinstance(t_detail, dict) and t_detail.get("address"):
+                st_obj = t_detail.get("status")
+                st_state = st_obj.get("state") if isinstance(st_obj, dict) else (st_obj if isinstance(st_obj, str) else None)
+                st_app = st_obj.get("app") if isinstance(st_obj, dict) else None
+                st_msg = st_obj.get("msg") if isinstance(st_obj, dict) else None
+                labels = t_detail.get("labels") or {}
+                merged_terms[addr] = {
+                    "address": addr,
+                    "agent": st_app or t_detail.get("agent") or "",
+                    "status": str(st_state).lower() if st_state else "",
+                    "title": str(t_detail.get("title") or "").strip(),
+                    "msg": str(st_msg or "").strip(),
+                    "cwd": str(t_detail.get("cwd") or ""),
+                    "turn": t_detail.get("turn"),
+                    "where": str(labels.get("where") or "").strip(),
+                    "space_id": str(labels.get("herdr.space") or "").strip(),
+                }
+
+    # Track spaces per hc_host
+    spaces_by_host: dict[str, list[dict[str, Any]]] = {h: [] for h in hc_hosts_order}
+    assigned_addrs: set[str] = set()
+
+    def build_hc_agent(
+        addr: str,
+        host_key: str,
+        ws_id: str,
+        ws_num: int,
+        ws_label: str,
+        tab_id: str,
+        focused: bool,
+        fallback_app: str = "",
+        fallback_status: str = "",
+        fallback_name: str = "",
+    ) -> dict[str, Any] | None:
+        tinfo = merged_terms.get(addr, {})
+        raw_status = (fallback_status or tinfo.get("status") or "").lower()
+        if not raw_status:
+            return None
+        status = raw_status if raw_status in STATUS_PRIORITY else "unknown"
+        agent_name = fallback_app or tinfo.get("agent") or "agent"
+        if agent_name in ("zsh", "bash", "fish", "nu", "sh") and not raw_status:
+            return None
+
+        raw_title = fallback_name or tinfo.get("title") or ""
+        clean_title = strip_agent_title(raw_title)
+        if not clean_title and tinfo.get("msg"):
+            first_line = tinfo["msg"].splitlines()[0].strip()
+            clean_title = (first_line[:68] + "…") if len(first_line) > 69 else first_line
+        if not clean_title:
+            clean_title = tinfo.get("where") or ws_label or agent_name
+
+        cwd = shorten_cwd(tinfo.get("cwd") or "", home)
+        turn = tinfo.get("turn")
+        hmeta = hc_host_info[host_key]
+
+        return {
+            "key": f"hc:{hmeta['id']}:{addr}",
+            "backend": "hc",
+            "machine_id": hmeta["id"],
+            "machine_label": hmeta["label"],
+            "machine_short": hmeta["short_label"],
+            "is_local": hmeta["isLocal"],
+            "workspace_id": ws_id,
+            "workspace_number": ws_num,
+            "workspace_label": ws_label,
+            "tab_id": tab_id,
+            "pane_id": addr,
+            "agent": agent_name,
+            "agent_status": status,
+            "title": clean_title,
+            "subtitle": f"{ws_label}" if ws_label and ws_label != clean_title else "",
+            "cwd": cwd,
+            "context": f"turn {turn}" if turn is not None else "",
+            "limit": "",
+            "cache": "",
+            "focused": focused,
+        }
+
+    # First populate spaces from herdr-app ls if available
+    if app_data and isinstance(app_data.get("spaces"), list):
+        host_ws_counter: dict[str, int] = {}
+        for sp in app_data["spaces"]:
+            if not isinstance(sp, dict):
+                continue
+            sp_machine = str(sp.get("machine") or "").strip() or "local"
+            if sp_machine not in hc_host_info:
+                hc_hosts_order.append(sp_machine)
+                hc_host_info[sp_machine] = {
+                    "host": sp_machine,
+                    "id": f"hc:{sp_machine}",
+                    "short_label": f"hc · {sp_machine}",
+                    "label": f"Herdr App · {sp_machine}",
+                    "target": sp_machine,
+                    "isLocal": sp_machine == "local",
+                    "reachable": True,
+                }
+                spaces_by_host[sp_machine] = []
+
+            host_ws_counter[sp_machine] = host_ws_counter.get(sp_machine, 0) + 1
+            ws_num = host_ws_counter[sp_machine]
+            ws_id = str(sp.get("id") or f"hc-space-{ws_num}")
+            ws_label = str(sp.get("name") or ws_id).strip()
+            ws_focused = bool(sp.get("active"))
+            ws_folder = shorten_cwd(str(sp.get("folder") or ""), home)
+
+            ws_agents: list[dict[str, Any]] = []
+            pane_count = 0
+            tabs = sp.get("tabs") or []
+            for tab in tabs:
+                tab_id = str(tab.get("id") or "")
+                tab_active = bool(tab.get("active"))
+                for term_entry in tab.get("terminals") or []:
+                    pane_count += 1
+                    addr = str(term_entry.get("terminal") or "").strip()
+                    if not addr or addr in assigned_addrs:
+                        continue
+                    assigned_addrs.add(addr)
+                    ag = build_hc_agent(
+                        addr=addr,
+                        host_key=sp_machine,
+                        ws_id=ws_id,
+                        ws_num=ws_num,
+                        ws_label=ws_label,
+                        tab_id=tab_id,
+                        focused=ws_focused and tab_active,
+                        fallback_app=str(term_entry.get("app") or ""),
+                        fallback_status=str(term_entry.get("status") or ""),
+                        fallback_name=str(term_entry.get("name") or ""),
+                    )
+                    if ag is not None:
+                        if not ag["cwd"] and ws_folder:
+                            ag["cwd"] = ws_folder
+                        ws_agents.append(ag)
+
+            ws_agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
+            if ws_agents or include_empty_spaces:
+                ws_status = ws_agents[0]["agent_status"] if ws_agents else "none"
+                spaces_by_host[sp_machine].append(
+                    {
+                        "workspace_id": ws_id,
+                        "number": ws_num,
+                        "label": ws_label,
+                        "focused": ws_focused,
+                        "pane_count": max(pane_count, len(ws_agents)),
+                        "tab_count": len(tabs) or 1,
+                        "agent_status": ws_status,
+                        "agents": ws_agents,
+                    }
+                )
+
+    # Also include any remaining live agent terminals from hc ls / terminals.json not covered by herdr-app ls
+    fallback_groups: dict[tuple[str, str], list[str]] = {}
+    for addr, tinfo in merged_terms.items():
+        if addr in assigned_addrs:
+            continue
+        if not tinfo.get("status"):
+            continue
+        host_key = addr.split("/", 1)[0] if "/" in addr else "local"
+        if host_key not in hc_host_info:
+            hc_hosts_order.append(host_key)
+            hc_host_info[host_key] = {
+                "host": host_key,
+                "id": f"hc:{host_key}",
+                "short_label": f"hc · {host_key}",
+                "label": f"Herdr App · {host_key}",
+                "target": host_key,
+                "isLocal": host_key == "local",
+                "reachable": True,
+            }
+            spaces_by_host[host_key] = []
+        where = tinfo.get("where") or "Herdr App"
+        space_name = where.split(" / ", 1)[0].strip() or "Herdr App"
+        fallback_groups.setdefault((host_key, space_name), []).append(addr)
+
+    for (host_key, space_name), addrs in fallback_groups.items():
+        ws_num = len(spaces_by_host[host_key]) + 1
+        first_info = merged_terms.get(addrs[0], {})
+        ws_id = first_info.get("space_id") or f"hc-{host_key}-{ws_num}"
+        ws_agents = []
+        for addr in addrs:
+            ag = build_hc_agent(
+                addr=addr,
+                host_key=host_key,
+                ws_id=ws_id,
+                ws_num=ws_num,
+                ws_label=space_name,
+                tab_id="",
+                focused=False,
+            )
+            if ag is not None:
+                ws_agents.append(ag)
+        ws_agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
+        if ws_agents:
+            spaces_by_host[host_key].append(
+                {
+                    "workspace_id": ws_id,
+                    "number": ws_num,
+                    "label": space_name,
+                    "focused": False,
+                    "pane_count": len(ws_agents),
+                    "tab_count": 1,
+                    "agent_status": ws_agents[0]["agent_status"],
+                    "agents": ws_agents,
+                }
+            )
+
+    # Build final machine objects for hc hosts
+    results: list[dict[str, Any]] = []
+    for host_key in hc_hosts_order:
+        hmeta = hc_host_info[host_key]
+        ws_list = spaces_by_host.get(host_key) or []
+        counts = {"total": 0, "blocked": 0, "working": 0, "idle": 0, "done": 0, "unknown": 0}
+        for ws in ws_list:
+            for ag in ws.get("agents") or []:
+                st = ag["agent_status"] if ag["agent_status"] in counts else "unknown"
+                counts["total"] += 1
+                counts[st] += 1
+
+        results.append(
+            {
+                "id": hmeta["id"],
+                "label": hmeta["label"],
+                "short_label": hmeta["short_label"],
+                "target": hmeta["target"],
+                "session": "default",
+                "isLocal": hmeta["isLocal"],
+                "backend": "hc",
+                "reachable": hmeta["reachable"],
+                "counts": counts,
+                "workspaces": ws_list,
+            }
+        )
+
+    return results
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Collect Herdr multi-machine fleet status")
-    parser.add_argument("--include-hc", default="0", help="1 to query hc (herdr-core), 0 to skip")
+    parser.add_argument("--include-hc", default="1", help="1 to query hc (herdr-core), 0 to skip")
     parser.add_argument("--include-remote", default="1", help="1 to query remote SSH machines, 0 for local only")
     parser.add_argument("--include-empty-spaces", default="1", help="1 to include workspaces without agents")
     parser.add_argument("--timeout", type=float, default=3.5, help="Per-machine timeout in seconds")
@@ -380,15 +714,18 @@ def main() -> int:
             pool.submit(fetch_machine, m, args.timeout, home, include_empty_spaces)
             for m in machines_cfg
         ]
-        hc_future = pool.submit(fetch_hc, 2.0, home) if include_hc else None
+        hc_future = (
+            pool.submit(fetch_hc_machines, args.timeout, home, include_remote, include_empty_spaces)
+            if include_hc
+            else None
+        )
 
         for fut in futures:
             machines_out.append(fut.result())
 
         if hc_future is not None:
-            hc_res = hc_future.result()
-            if hc_res is not None and hc_res["counts"]["total"] > 0:
-                machines_out.append(hc_res)
+            for hc_m in hc_future.result():
+                machines_out.append(hc_m)
 
     totals = {
         "machines_total": len(machines_out),

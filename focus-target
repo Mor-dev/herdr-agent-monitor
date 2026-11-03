@@ -48,15 +48,36 @@ focus_niri_herdr_window() {
     fi
 }
 
+focus_niri_hc_window() {
+    command -v niri >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local windows_json win_id
+    windows_json="$(niri msg -j windows 2>/dev/null)" || return 0
+    [[ -n "$windows_json" ]] || return 0
+
+    win_id="$(jq -r '.[] | select((.app_id // "" | ascii_downcase) == "herdr-app" or (.title // "" | ascii_downcase) == "herdr") | .id' <<<"$windows_json" 2>/dev/null | head -n1)"
+    if [[ -n "$win_id" ]]; then
+        niri msg action focus-window --id "$win_id" >/dev/null 2>&1
+    fi
+}
+
 if [[ "$kind" == "window" ]]; then
-    focus_niri_herdr_window
+    if [[ "$backend" == "hc" ]]; then
+        focus_niri_hc_window
+    else
+        focus_niri_herdr_window
+    fi
     exit 0
 fi
 
 if [[ "$backend" == "hc" ]]; then
-    if [[ -n "$target_id" ]]; then
+    if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
+        herdr-app do space.select --id "$target_id" >/dev/null 2>&1 || true
+    elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
         herdr-app do agent.focus --terminal "$target_id" >/dev/null 2>&1 || true
     fi
+    focus_niri_hc_window
     exit 0
 fi
 

@@ -9,7 +9,7 @@ PluginSettings {
 
     StyledText {
         width: parent.width
-        text: I18n.trFor("herdrAgentMonitor", "herdr Agent Monitor")
+        text: I18n.trFor("herdrAgentMonitor", "Herdr Agent Monitor")
         font.pixelSize: Theme.fontSizeLarge
         font.weight: Font.Medium
         color: Theme.surfaceText
@@ -33,8 +33,8 @@ PluginSettings {
     ToggleSetting {
         settingKey: "includeHerdrCore"
         label: I18n.trFor("herdrAgentMonitor", "Include Herdr Desktop App (hc)")
-        description: I18n.trFor("herdrAgentMonitor", "Queries `hc ls --json` (`herdr-core`) to include terminals from the graphical desktop app")
-        defaultValue: false
+        description: I18n.trFor("herdrAgentMonitor", "Queries `herdr-app ls`, `herdr-core` state, and `hc ls --json` across local and remote `hc` machines")
+        defaultValue: true
     }
 
     ToggleSetting {
