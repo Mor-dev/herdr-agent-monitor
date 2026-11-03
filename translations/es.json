@@ -1,0 +1,104 @@
+{
+  "herdr Agent Monitor": {
+    "herdr Agent Monitor": "herdr Agent Monitor"
+  },
+  "%1 agents · %2 spaces · %3/%4 hosts": {
+    "%1 agents · %2 spaces · %3/%4 hosts": "%1 agentes · %2 spaces · %3/%4 hosts"
+  },
+  "%1 blocked": {
+    "%1 blocked": "%1 bloqueados"
+  },
+  "%1 working": {
+    "%1 working": "%1 trabajando"
+  },
+  "%1 idle": {
+    "%1 idle": "%1 en espera"
+  },
+  "%1 done": {
+    "%1 done": "%1 listos"
+  },
+  "All (%1)": {
+    "All (%1)": "Todas (%1)"
+  },
+  "· %1 spaces · %2 agents": {
+    "· %1 spaces · %2 agents": "· %1 spaces · %2 agentes"
+  },
+  "· offline": {
+    "· offline": "· sin conexión"
+  },
+  "agent": {
+    "agent": "agente"
+  },
+  "blocked": {
+    "blocked": "bloqueado"
+  },
+  "working": {
+    "working": "trabajando"
+  },
+  "idle": {
+    "idle": "en espera"
+  },
+  "done": {
+    "done": "listo"
+  },
+  "unknown": {
+    "unknown": "desconocido"
+  },
+  "1 pane": {
+    "1 pane": "1 panel"
+  },
+  "%1 panes": {
+    "%1 panes": "%1 paneles"
+  },
+  "No active agents across monitored machines": {
+    "No active agents across monitored machines": "No hay agentes activos en las máquinas monitoreadas"
+  },
+  "Monitors herdr agents and workspaces across your local machine, remote SSH machines (`herdr machine list`), and optionally the Herdr Desktop App (`hc` / `herdr-core`). Left-click opens the popout, right-click refreshes, middle-click focuses the herdr window.": {
+    "Monitors herdr agents and workspaces across your local machine, remote SSH machines (`herdr machine list`), and optionally the Herdr Desktop App (`hc` / `herdr-core`). Left-click opens the popout, right-click refreshes, middle-click focuses the herdr window.": "Supervisa agentes y spaces de herdr en tu máquina local, máquinas remotas por SSH (`herdr machine list`) y opcionalmente la nueva Herdr Desktop App (`hc` / `herdr-core`). Clic izquierdo abre el panel, clic derecho refresca, clic medio enfoca la ventana de herdr."
+  },
+  "Monitor remote machines (SSH)": {
+    "Monitor remote machines (SSH)": "Monitorear máquinas remotas (SSH)"
+  },
+  "Queries all enabled machines in `herdr machine list` via `herdr --machine <host> api snapshot`": {
+    "Queries all enabled machines in `herdr machine list` via `herdr --machine <host> api snapshot`": "Consulta todas las máquinas habilitadas en `herdr machine list` mediante `herdr --machine <host> api snapshot`"
+  },
+  "Include Herdr Desktop App (hc)": {
+    "Include Herdr Desktop App (hc)": "Incluir Herdr Desktop App (hc)"
+  },
+  "Queries `hc ls --json` (`herdr-core`) to include terminals from the graphical desktop app": {
+    "Queries `hc ls --json` (`herdr-core`) to include terminals from the graphical desktop app": "Consulta también `hc ls --json` (`herdr-core`) para mostrar las terminales de la app gráfica de escritorio"
+  },
+  "Show spaces without active agents": {
+    "Show spaces without active agents": "Mostrar spaces sin agentes activos"
+  },
+  "Includes open workspaces in the tree even when they have no running agent": {
+    "Includes open workspaces in the tree even when they have no running agent": "Incluye en la lista los workspaces abiertos aunque no tengan un agente corriendo actualmente"
+  },
+  "Bar pill label": {
+    "Bar pill label": "Texto en la barra"
+  },
+  "What counter to display next to the bar icon": {
+    "What counter to display next to the bar icon": "Qué contador mostrar junto al ícono en la barra"
+  },
+  "Total agents (highlighted when active)": {
+    "Total agents (highlighted when active)": "Total de agentes (con alerta si hay activos)"
+  },
+  "Breakdown (blocked / working / total)": {
+    "Breakdown (blocked / working / total)": "Desglose (bloqueados / trabajando / total)"
+  },
+  "Blocked + working only": {
+    "Blocked + working only": "Solo bloqueados + trabajando"
+  },
+  "Icon only": {
+    "Icon only": "Solo ícono"
+  },
+  "Refresh interval": {
+    "Refresh interval": "Intervalo de actualización"
+  },
+  "How often to poll machine snapshots (seconds)": {
+    "How often to poll machine snapshots (seconds)": "Con qué frecuencia consultar el estado de las máquinas (segundos)"
+  },
+  "sec": {
+    "sec": "seg"
+  }
+}

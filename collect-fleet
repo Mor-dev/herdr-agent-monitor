@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Parallel multi-machine & workspace collector for herdr Agent Monitor (herdrAgentMonitor).
+
+Queries local `herdr api snapshot`, all enabled SSH machines from `herdr machine list`,
+and optionally `hc ls --json` (Herdr Desktop App / herdr-core), returning a single
+compact JSON document for the Quickshell widget.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import socket
+import subprocess
+import sys
+from typing import Any
+
+
+STATUS_PRIORITY = {
+    "blocked": 0,
+    "working": 1,
+    "idle": 2,
+    "unknown": 3,
+    "done": 4,
+}
+
+
+def shorten_cwd(cwd: str, home: str) -> str:
+    if not cwd:
+        return ""
+    if home and (cwd == home or cwd.startswith(home + "/")):
+        return "~" + cwd[len(home) :]
+    for prefix in ("/home/", "/Users/"):
+        if cwd.startswith(prefix):
+            parts = cwd[len(prefix) :].split("/", 1)
+            if len(parts) == 1:
+                return "~"
+            return "~/" + parts[1]
+    return cwd
+
+
+def run_json_cmd(cmd: list[str], timeout: float) -> dict[str, Any] | None:
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        return json.loads(res.stdout)
+    except Exception:
+        return None
+
+
+def get_configured_machines(include_remote: bool, timeout: float) -> list[dict[str, Any]]:
+    hostname = socket.gethostname()
+    seen_targets: set[tuple[str, str]] = {
+        ("local", "default"),
+        ("localhost", "default"),
+        (hostname, "default"),
+    }
+    machines: list[dict[str, Any]] = [
+        {
+            "id": "local",
+            "label": f"local ({hostname})",
+            "short_label": "local",
+            "target": "local",
+            "session": "default",
+            "isLocal": True,
+        }
+    ]
+    if not include_remote:
+        return machines
+
+    try:
+        res = subprocess.run(
+            ["herdr", "machine", "list"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if res.returncode == 0:
+            for raw in res.stdout.splitlines():
+                parts = raw.strip().split("\t")
+                if len(parts) >= 5 and parts[4] == "enabled":
+                    mid, target, session = parts[1], parts[2], parts[3] or "default"
+                    canon_key = (target, session)
+                    if canon_key in seen_targets:
+                        continue
+                    seen_targets.add(canon_key)
+                    machines.append(
+                        {
+                            "id": mid,
+                            "label": mid,
+                            "short_label": mid,
+                            "target": target,
+                            "session": session,
+                            "isLocal": False,
+                        }
+                    )
+    except Exception:
+        pass
+    return machines
+
+
+def deduplicate_herdr_agents(raw_agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate agents by canonical (workspace_id, pane_id), keeping active over stale."""
+    best_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for idx, a in enumerate(raw_agents):
+        wid = str(a.get("workspace_id") or "default").strip()
+        pane_id = str(a.get("pane_id") or f"anon-{idx}").strip()
+        canon_key = (wid, pane_id)
+        st = str(a.get("agent_status") or "unknown").lower()
+        prio = STATUS_PRIORITY.get(st, 9)
+        if canon_key not in best_by_key:
+            order.append(canon_key)
+            best_by_key[canon_key] = a
+        else:
+            prev_st = str(best_by_key[canon_key].get("agent_status") or "unknown").lower()
+            prev_prio = STATUS_PRIORITY.get(prev_st, 9)
+            if prio < prev_prio or (prio == prev_prio and bool(a.get("focused"))):
+                best_by_key[canon_key] = a
+    return [best_by_key[k] for k in order]
+
+
+def parse_herdr_snapshot(
+    machine: dict[str, Any],
+    data: dict[str, Any] | None,
+    home: str,
+    include_empty_spaces: bool,
+) -> dict[str, Any]:
+    counts = {"total": 0, "blocked": 0, "working": 0, "idle": 0, "done": 0, "unknown": 0}
+    if not data or "result" not in data or "snapshot" not in data["result"]:
+        return {
+            **machine,
+            "backend": "herdr",
+            "reachable": False,
+            "counts": counts,
+            "workspaces": [],
+        }
+
+    snap = data["result"]["snapshot"]
+    raw_workspaces = snap.get("workspaces") or []
+    raw_panes = snap.get("panes") or []
+    raw_agents = deduplicate_herdr_agents(snap.get("agents") or [])
+
+    pane_by_id = {p.get("pane_id"): p for p in raw_panes if p.get("pane_id")}
+    ws_by_id: dict[str, dict[str, Any]] = {}
+    ws_order: list[str] = []
+
+    for w in sorted(raw_workspaces, key=lambda x: x.get("number", 999)):
+        wid = w.get("workspace_id")
+        if not wid or wid in ws_by_id:
+            continue
+        ws_order.append(wid)
+        ws_by_id[wid] = {
+            "workspace_id": wid,
+            "number": w.get("number", 0),
+            "label": w.get("label") or wid,
+            "focused": bool(w.get("focused", False)),
+            "pane_count": w.get("pane_count", 0),
+            "tab_count": w.get("tab_count", 0),
+            "agent_status": w.get("agent_status") or "unknown",
+            "agents": [],
+        }
+
+    for a in raw_agents:
+        pane_id = a.get("pane_id") or ""
+        wid = a.get("workspace_id") or "default"
+        pane = pane_by_id.get(pane_id, {})
+        if wid not in ws_by_id:
+            ws_order.append(wid)
+            ws_by_id[wid] = {
+                "workspace_id": wid,
+                "number": len(ws_order),
+                "label": wid,
+                "focused": False,
+                "pane_count": 1,
+                "tab_count": 1,
+                "agent_status": a.get("agent_status") or "unknown",
+                "agents": [],
+            }
+
+        status = (a.get("agent_status") or "unknown").lower()
+        if status not in counts:
+            status = "unknown"
+        counts["total"] += 1
+        counts[status] += 1
+
+        tokens = a.get("tokens") or pane.get("tokens") or {}
+        pane_label = (pane.get("label") or "").strip()
+        stripped_title = (
+            a.get("terminal_title_stripped")
+            or pane.get("terminal_title_stripped")
+            or ""
+        ).strip()
+        token_title = (tokens.get("title") or "").strip()
+
+        display_title = stripped_title or pane_label or token_title or (a.get("agent") or "agent")
+        subtitle = ""
+        if pane_label and pane_label != display_title:
+            subtitle = pane_label
+        elif token_title and token_title != display_title:
+            subtitle = token_title
+
+        cwd = a.get("foreground_cwd") or a.get("cwd") or pane.get("cwd") or ""
+        ws_info = ws_by_id[wid]
+
+        ws_info["agents"].append(
+            {
+                "key": f"herdr:{machine['id']}:{pane_id}",
+                "backend": "herdr",
+                "machine_id": machine["id"],
+                "machine_label": machine["label"],
+                "machine_short": machine["short_label"],
+                "is_local": machine["isLocal"],
+                "workspace_id": wid,
+                "workspace_number": ws_info["number"],
+                "workspace_label": ws_info["label"],
+                "tab_id": a.get("tab_id") or pane.get("tab_id") or "",
+                "pane_id": pane_id,
+                "agent": a.get("agent") or "agent",
+                "agent_status": status,
+                "title": display_title,
+                "subtitle": subtitle,
+                "cwd": shorten_cwd(cwd, home),
+                "context": (tokens.get("context") or "").strip(),
+                "limit": (tokens.get("limit") or "").strip(),
+                "cache": (tokens.get("cache_high") or "").strip(),
+                "focused": bool(a.get("focused", False)),
+            }
+        )
+
+    workspaces_out = []
+    for wid in ws_order:
+        w = ws_by_id[wid]
+        w["agents"].sort(
+            key=lambda item: (
+                STATUS_PRIORITY.get(item["agent_status"], 9),
+                item["pane_id"],
+            )
+        )
+        if w["agents"] or include_empty_spaces:
+            workspaces_out.append(w)
+
+    return {
+        **machine,
+        "backend": "herdr",
+        "reachable": True,
+        "counts": counts,
+        "workspaces": workspaces_out,
+    }
+
+
+def fetch_machine(
+    machine: dict[str, Any],
+    timeout: float,
+    home: str,
+    include_empty_spaces: bool,
+) -> dict[str, Any]:
+    if machine["isLocal"]:
+        cmd = ["herdr", "api", "snapshot"]
+    else:
+        cmd = ["herdr", "--machine", machine["id"], "api", "snapshot"]
+    data = run_json_cmd(cmd, timeout=timeout)
+    return parse_herdr_snapshot(machine, data, home, include_empty_spaces)
+
+
+def fetch_hc(timeout: float, home: str) -> dict[str, Any] | None:
+    data = run_json_cmd(["hc", "ls", "--json"], timeout=timeout)
+    if data is None:
+        return None
+
+    raw_terminals = [t for t in (data.get("terminals") or []) if t.get("status")]
+    seen_addrs: set[str] = set()
+    terminals: list[dict[str, Any]] = []
+    for idx, t in enumerate(raw_terminals, start=1):
+        addr = str(t.get("address") or f"t{idx}").strip()
+        if addr in seen_addrs:
+            continue
+        seen_addrs.add(addr)
+        terminals.append(t)
+
+    counts = {"total": 0, "blocked": 0, "working": 0, "idle": 0, "done": 0, "unknown": 0}
+    agents = []
+
+    for idx, t in enumerate(terminals, start=1):
+        status = (t.get("status") or "unknown").lower()
+        if status not in counts:
+            status = "unknown"
+        counts["total"] += 1
+        counts[status] += 1
+
+        addr = t.get("address") or f"t{idx}"
+        where = (t.get("where") or addr).strip()
+        agent_name = t.get("agent") or "agent"
+        cwd = shorten_cwd(t.get("cwd") or "", home)
+
+        agents.append(
+            {
+                "key": f"hc:hc:{addr}",
+                "backend": "hc",
+                "machine_id": "hc",
+                "machine_label": "Herdr App (hc)",
+                "machine_short": "hc",
+                "is_local": True,
+                "workspace_id": "hc-app",
+                "workspace_number": 1,
+                "workspace_label": "Herdr Desktop App",
+                "tab_id": "",
+                "pane_id": addr,
+                "agent": agent_name,
+                "agent_status": status,
+                "title": where,
+                "subtitle": agent_name,
+                "cwd": cwd,
+                "context": f"turn {t.get('turn')}" if t.get("turn") is not None else "",
+                "limit": "",
+                "cache": "",
+                "focused": False,
+            }
+        )
+
+    agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
+
+    workspaces = []
+    if agents:
+        workspaces.append(
+            {
+                "workspace_id": "hc-app",
+                "number": 1,
+                "label": "Herdr Desktop App (herdr-core)",
+                "focused": False,
+                "pane_count": len(agents),
+                "tab_count": 1,
+                "agent_status": agents[0]["agent_status"],
+                "agents": agents,
+            }
+        )
+
+    return {
+        "id": "hc",
+        "label": "Herdr App (hc)",
+        "short_label": "hc",
+        "target": "local",
+        "session": "default",
+        "isLocal": True,
+        "backend": "hc",
+        "reachable": True,
+        "counts": counts,
+        "workspaces": workspaces,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Collect Herdr multi-machine fleet status")
+    parser.add_argument("--include-hc", default="0", help="1 to query hc (herdr-core), 0 to skip")
+    parser.add_argument("--include-remote", default="1", help="1 to query remote SSH machines, 0 for local only")
+    parser.add_argument("--include-empty-spaces", default="1", help="1 to include workspaces without agents")
+    parser.add_argument("--timeout", type=float, default=3.5, help="Per-machine timeout in seconds")
+    args = parser.parse_args()
+
+    include_hc = str(args.include_hc).lower() in ("1", "true", "yes", "on")
+    include_remote = str(args.include_remote).lower() in ("1", "true", "yes", "on")
+    include_empty_spaces = str(args.include_empty_spaces).lower() in ("1", "true", "yes", "on")
+    home = os.environ.get("HOME", "")
+
+    machines_cfg = get_configured_machines(include_remote=include_remote, timeout=2.0)
+
+    machines_out: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(2, len(machines_cfg) + 1)) as pool:
+        futures = [
+            pool.submit(fetch_machine, m, args.timeout, home, include_empty_spaces)
+            for m in machines_cfg
+        ]
+        hc_future = pool.submit(fetch_hc, 2.0, home) if include_hc else None
+
+        for fut in futures:
+            machines_out.append(fut.result())
+
+        if hc_future is not None:
+            hc_res = hc_future.result()
+            if hc_res is not None and hc_res["counts"]["total"] > 0:
+                machines_out.append(hc_res)
+
+    totals = {
+        "machines_total": len(machines_out),
+        "machines_reachable": sum(1 for m in machines_out if m.get("reachable")),
+        "workspaces": sum(len(m.get("workspaces") or []) for m in machines_out),
+        "agents": sum(m["counts"]["total"] for m in machines_out),
+        "blocked": sum(m["counts"]["blocked"] for m in machines_out),
+        "working": sum(m["counts"]["working"] for m in machines_out),
+        "idle": sum(m["counts"]["idle"] for m in machines_out),
+        "done": sum(m["counts"]["done"] for m in machines_out),
+    }
+
+    flat_agents: list[dict[str, Any]] = []
+    for m in machines_out:
+        for ws in m.get("workspaces") or []:
+            for ag in ws.get("agents") or []:
+                flat_agents.append(ag)
+
+    flat_agents.sort(
+        key=lambda item: (
+            STATUS_PRIORITY.get(item["agent_status"], 9),
+            0 if item["is_local"] else 1,
+            item["machine_short"],
+            item["workspace_number"],
+            item["pane_id"],
+        )
+    )
+
+    payload = {
+        "ok": totals["machines_reachable"] > 0,
+        "totals": totals,
+        "machines": machines_out,
+        "agents": flat_agents,
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

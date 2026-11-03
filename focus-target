@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Focuses an agent pane or workspace in herdr (local or remote machine) or Herdr App (hc),
+# and focuses the terminal window running herdr in Niri if available.
+#
+# Usage:
+#   focus-target agent <backend> <machine_id> <pane_id>
+#   focus-target workspace <backend> <machine_id> <workspace_id>
+#   focus-target window
+
+set -u
+
+kind="${1:-window}"
+backend="${2:-herdr}"
+machine="${3:-local}"
+target_id="${4:-}"
+
+focus_niri_herdr_window() {
+    command -v niri >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local windows_json
+    windows_json="$(niri msg -j windows 2>/dev/null)" || return 0
+    [[ -n "$windows_json" ]] || return 0
+
+    # Find any window whose child process tree includes `herdr`
+    local herdr_pids win_id win_pid p
+    herdr_pids="$(pgrep -x herdr 2>/dev/null || true)"
+    if [[ -n "$herdr_pids" ]]; then
+        while IFS=$'\t' read -r win_id win_pid; do
+            [[ -n "$win_id" && -n "$win_pid" ]] || continue
+            for p in $herdr_pids; do
+                local cur="$p"
+                while [[ -n "$cur" && "$cur" != "1" && "$cur" != "0" ]]; do
+                    if [[ "$cur" == "$win_pid" ]]; then
+                        niri msg action focus-window --id "$win_id" >/dev/null 2>&1
+                        return 0
+                    fi
+                    cur="$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')"
+                done
+            done
+        done < <(jq -r '.[] | "\(.id)\t\(.pid // "")"' <<<"$windows_json" 2>/dev/null)
+    fi
+
+    # Fallback: window title containing herdr
+    win_id="$(jq -r '.[] | select((.title // "" | ascii_downcase | contains("herdr")) or (.app_id // "" | ascii_downcase | contains("herdr"))) | .id' <<<"$windows_json" 2>/dev/null | head -n1)"
+    if [[ -n "$win_id" ]]; then
+        niri msg action focus-window --id "$win_id" >/dev/null 2>&1
+    fi
+}
+
+if [[ "$kind" == "window" ]]; then
+    focus_niri_herdr_window
+    exit 0
+fi
+
+if [[ "$backend" == "hc" ]]; then
+    if [[ -n "$target_id" ]]; then
+        herdr-app do agent.focus --terminal "$target_id" >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+
+if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
+    if [[ "$machine" == "local" || -z "$machine" ]]; then
+        herdr workspace focus "$target_id" >/dev/null 2>&1 || true
+    else
+        herdr --machine "$machine" workspace focus "$target_id" >/dev/null 2>&1 || true
+    fi
+elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
+    if [[ "$machine" == "local" || -z "$machine" ]]; then
+        herdr agent focus "$target_id" >/dev/null 2>&1 || true
+    else
+        herdr --machine "$machine" agent focus "$target_id" >/dev/null 2>&1 || true
+    fi
+fi
+
+focus_niri_herdr_window
+exit 0
