@@ -59,13 +59,25 @@ PluginComponent {
         varName: "searchQuery"
         defaultValue: ""
     }
+    PluginGlobalVar {
+        id: sharedSelectedStatus
+        varName: "selectedStatus"
+        defaultValue: "all"
+    }
+    PluginGlobalVar {
+        id: sharedInterceptedNotifs
+        varName: "interceptedNotifs"
+        defaultValue: ({})
+    }
 
     readonly property var fleet: sharedFleet.value || ({ totals: {}, machines: [], agents: [] })
     readonly property var totals: fleet.totals || ({ machines_total: 0, machines_reachable: 0, workspaces: 0, agents: 0, blocked: 0, working: 0, idle: 0, done: 0 })
     readonly property var machines: fleet.machines || []
     readonly property var agents: fleet.agents || []
     readonly property string selectedMachine: sharedSelectedMachine.value || "all"
+    readonly property string selectedStatus: sharedSelectedStatus.value || "all"
     readonly property string searchQuery: (sharedSearchQuery.value || "").trim().toLowerCase()
+    readonly property bool hasActiveFilter: searchQuery.length > 0 || selectedStatus !== "all"
     readonly property int currentIntervalMs: Math.min(baseIntervalMs * Math.pow(2, sharedFailures.value), maxIntervalMs)
 
     property var fleetPopout: null
@@ -199,12 +211,17 @@ PluginComponent {
     function filteredAgentsForWorkspace(m, ws) {
         var list = (ws && ws.agents) || [];
         var q = root.searchQuery;
-        if (!q)
+        var st = root.selectedStatus;
+        if (!q && st === "all")
             return list;
         var out = [];
         for (var i = 0; i < list.length; i++) {
-            if (root.agentMatchesSearch(list[i], m, ws, q))
-                out.push(list[i]);
+            var ag = list[i];
+            if (st !== "all" && (ag ? ag.agent_status : "") !== st)
+                continue;
+            if (q && !root.agentMatchesSearch(ag, m, ws, q))
+                continue;
+            out.push(ag);
         }
         return out;
     }
@@ -212,13 +229,14 @@ PluginComponent {
     function filteredWorkspacesForMachine(m) {
         var wsList = (m && m.workspaces) || [];
         var q = root.searchQuery;
-        if (!q)
+        var st = root.selectedStatus;
+        if (!q && st === "all")
             return wsList;
         var out = [];
         for (var i = 0; i < wsList.length; i++) {
             var ws = wsList[i];
             var matchedAgents = root.filteredAgentsForWorkspace(m, ws);
-            if (matchedAgents.length > 0 || (root.includeEmptySpaces && root.agentMatchesSearch(null, m, ws, q)))
+            if (matchedAgents.length > 0 || (st === "all" && root.includeEmptySpaces && root.agentMatchesSearch(null, m, ws, q)))
                 out.push(ws);
         }
         return out;
@@ -411,7 +429,9 @@ PluginComponent {
             "agent",
             agent.backend || "herdr",
             agent.machine_id || "local",
-            agent.pane_id || ""
+            agent.pane_id || "",
+            agent.workspace_id || "",
+            agent.tab_id || ""
         ]);
     }
 
@@ -432,6 +452,73 @@ PluginComponent {
         if (!root.pluginDir)
             return;
         Quickshell.execDetached(["bash", root.focusScript, "window"]);
+    }
+
+    function interceptHerdrNotifications() {
+        if (!root.pluginDir || typeof NotificationService === "undefined" || !NotificationService)
+            return;
+        var roots = Local.HerdrFleetController.liveRoots || [];
+        if (roots.length > 0 && roots[0] !== root)
+            return;
+
+        var wrappers = NotificationService.allWrappers || [];
+        var seen = Object.assign({}, sharedInterceptedNotifs.value || {});
+        var toReemit = [];
+        for (var i = 0; i < wrappers.length; i++) {
+            var w = wrappers[i];
+            if (!w || !w.notification)
+                continue;
+            var app = (w.appName || "").toString().trim().toLowerCase();
+            if (app !== "herdr")
+                continue;
+            var actions = w.actions || [];
+            if (actions.length > 0)
+                continue;
+            var nid = (w.notification.id !== undefined ? w.notification.id : "").toString() + ":" + (w.time ? w.time.getTime() : 0);
+            if (seen[nid])
+                continue;
+            seen[nid] = true;
+            toReemit.push({
+                wrapper: w,
+                summary: (w.summary || "").toString(),
+                body: (w.body || "").toString()
+            });
+        }
+        if (toReemit.length === 0)
+            return;
+
+        sharedInterceptedNotifs.set(seen);
+        Qt.callLater(() => {
+            try {
+                if (NotificationService._recentDedupKeys !== undefined)
+                    NotificationService._recentDedupKeys = [];
+            } catch (e) {}
+            for (var j = 0; j < toReemit.length; j++) {
+                var item = toReemit[j];
+                try {
+                    if (item.wrapper && NotificationService.permanentlyDismissNotification)
+                        NotificationService.permanentlyDismissNotification(item.wrapper);
+                    else if (item.wrapper && item.wrapper.notification)
+                        item.wrapper.notification.dismiss();
+                } catch (e) {}
+                Quickshell.execDetached([
+                    "bash",
+                    root.focusScript,
+                    "reemit-notification",
+                    item.summary,
+                    item.body
+                ]);
+            }
+            root.refreshNow();
+        });
+    }
+
+    Connections {
+        target: typeof NotificationService !== "undefined" ? NotificationService : null
+        ignoreUnknownSignals: true
+        function onAllWrappersChanged() {
+            root.interceptHerdrNotifications();
+        }
     }
 
     // IPC handlers
@@ -586,101 +673,172 @@ PluginComponent {
                 width: parent.width
                 spacing: Theme.spacingS
 
-                // ── Top status bar + quick actions (hc toggle & refresh) ──
-                Row {
+                // ── Top Interactive Status Filter Pills (blocked, working, idle, done) ──
+                Flow {
+                    id: statusFilterFlow
                     width: parent.width
                     spacing: Theme.spacingXS
 
-                    // Summary status badges
+                    Repeater {
+                        model: ["blocked", "working", "idle", "done"]
+
+                        delegate: StyledRect {
+                            id: statusPill
+                            required property string modelData
+                            readonly property bool isSelected: root.selectedStatus === modelData
+                            readonly property int statusCount: root.totals[modelData] || 0
+                            readonly property color accentColor: root.statusColor(modelData)
+
+                            height: statusPillRow.implicitHeight + Theme.spacingXS * 2
+                            width: statusPillRow.implicitWidth + Theme.spacingS * 2
+                            radius: Theme.cornerRadiusFull
+                            color: isSelected
+                                ? Theme.withAlpha(accentColor, 0.24)
+                                : (statusPillMouse.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer)
+                            border.width: isSelected ? Theme.outlineWidth : 0
+                            border.color: isSelected ? accentColor : "transparent"
+                            opacity: isSelected ? 1.0 : (root.selectedStatus !== "all" ? 0.65 : (statusCount > 0 ? 1.0 : 0.72))
+
+                            Row {
+                                id: statusPillRow
+                                anchors.centerIn: parent
+                                spacing: Theme.spacingXXS
+
+                                DankIcon {
+                                    name: root.statusIcon(statusPill.modelData)
+                                    color: statusPill.accentColor
+                                    size: Theme.iconSizeSmall
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                StyledText {
+                                    text: statusPill.statusCount + " " + root.statusLabel(statusPill.modelData)
+                                    color: statusPill.isSelected || (statusPill.modelData === "blocked" && statusPill.statusCount > 0)
+                                        ? statusPill.accentColor
+                                        : Theme.surfaceText
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.weight: statusPill.isSelected || (statusPill.modelData === "blocked" && statusPill.statusCount > 0)
+                                        ? Font.Bold
+                                        : Font.Normal
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                            }
+
+                            MouseArea {
+                                id: statusPillMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: sharedSelectedStatus.set(statusPill.isSelected ? "all" : statusPill.modelData)
+                            }
+                        }
+                    }
+                }
+
+                // ── Live Search Bar + Quick Actions (hc toggle & refresh) ──
+                Row {
+                    id: searchToolbarRow
+                    width: parent.width
+                    spacing: Theme.spacingXS
+
                     StyledRect {
-                        height: summaryRow.implicitHeight + Theme.spacingXS * 2
-                        width: summaryRow.implicitWidth + Theme.spacingM * 2
-                        radius: Theme.cornerRadiusFull
+                        id: searchBarRect
+                        width: Math.max(Theme.spacingXL * 3, parent.width - hcChip.width - refreshBtn.width - Theme.spacingXS * 2)
+                        height: Theme.listItemHeight - Theme.spacingS
+                        radius: Theme.cornerRadius
                         color: Theme.surfaceContainer
+                        border.width: Theme.outlineWidth
+                        border.color: searchInput.activeFocus ? Theme.primary : "transparent"
 
-                        Row {
-                            id: summaryRow
-                            anchors.centerIn: parent
-                            spacing: Theme.spacingS
+                        DankIcon {
+                            id: searchBarIcon
+                            name: "search"
+                            size: Theme.iconSizeSmall
+                            color: searchInput.activeFocus ? Theme.primary : Theme.surfaceVariantText
+                            anchors.left: parent.left
+                            anchors.leftMargin: Theme.spacingS
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
 
-                            Row {
-                                spacing: Theme.spacingXXS
-                                visible: (root.totals.blocked || 0) > 0
-                                DankIcon {
-                                    name: "warning"
-                                    color: Theme.error
-                                    size: Theme.iconSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                StyledText {
-                                    text: I18n.trFor("herdrAgentMonitor", "%1 blocked").arg(root.totals.blocked || 0)
-                                    color: Theme.error
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    font.weight: Font.Bold
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
+                        Item {
+                            anchors.left: searchBarIcon.right
+                            anchors.leftMargin: Theme.spacingXS
+                            anchors.right: clearSearchBtn.visible ? clearSearchBtn.left : parent.right
+                            anchors.rightMargin: Theme.spacingS
+                            anchors.top: parent.top
+                            anchors.bottom: parent.bottom
+
+                            StyledText {
+                                visible: searchInput.text.length === 0
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                elide: Text.ElideRight
+                                text: I18n.trFor("herdrAgentMonitor", "Search agents, spaces, machines, cwd…")
+                                color: Theme.surfaceVariantText
+                                font.pixelSize: Theme.fontSizeSmall
                             }
 
-                            Row {
-                                spacing: Theme.spacingXXS
-                                DankIcon {
-                                    name: "bolt"
-                                    color: Theme.primary
-                                    size: Theme.iconSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
+                            TextInput {
+                                id: searchInput
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                clip: true
+                                selectByMouse: true
+                                color: Theme.surfaceText
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSizeSmall
+                                text: sharedSearchQuery.value || ""
+                                onTextChanged: {
+                                    if ((sharedSearchQuery.value || "") !== text)
+                                        sharedSearchQuery.set(text);
                                 }
-                                StyledText {
-                                    text: I18n.trFor("herdrAgentMonitor", "%1 working").arg(root.totals.working || 0)
-                                    color: Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                            }
-
-                            Row {
-                                spacing: Theme.spacingXXS
-                                DankIcon {
-                                    name: "pause_circle"
-                                    color: Theme.warning
-                                    size: Theme.iconSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                StyledText {
-                                    text: I18n.trFor("herdrAgentMonitor", "%1 idle").arg(root.totals.idle || 0)
-                                    color: Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
+                                onAccepted: {
+                                    if (root.firstMatchingAgent) {
+                                        root.focusAgent(root.firstMatchingAgent);
+                                        popout.closePopout();
+                                    }
                                 }
                             }
+                        }
 
-                            Row {
-                                spacing: Theme.spacingXXS
-                                visible: (root.totals.done || 0) > 0
-                                DankIcon {
-                                    name: "check_circle"
-                                    color: Theme.success
-                                    size: Theme.iconSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-                                StyledText {
-                                    text: I18n.trFor("herdrAgentMonitor", "%1 done").arg(root.totals.done || 0)
-                                    color: Theme.surfaceText
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    anchors.verticalCenter: parent.verticalCenter
+                        StyledRect {
+                            id: clearSearchBtn
+                            visible: searchInput.text.length > 0
+                            width: Theme.iconSizeSmall + Theme.spacingS
+                            height: Theme.iconSizeSmall + Theme.spacingS
+                            radius: Theme.cornerRadiusFull
+                            anchors.right: parent.right
+                            anchors.rightMargin: Theme.spacingXS
+                            anchors.verticalCenter: parent.verticalCenter
+                            color: clearSearchMouse.containsMouse ? Theme.surfaceContainerHighest : "transparent"
+
+                            DankIcon {
+                                anchors.centerIn: parent
+                                name: "close"
+                                size: Theme.iconSizeSmall
+                                color: Theme.surfaceVariantText
+                            }
+
+                            MouseArea {
+                                id: clearSearchMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    searchInput.text = "";
+                                    sharedSearchQuery.set("");
+                                    searchInput.forceActiveFocus();
                                 }
                             }
                         }
                     }
 
-                    Item {
-                        width: Math.max(Theme.spacingXS, parent.width - summaryRow.parent.width - hcChip.width - refreshBtn.width - Theme.spacingXS * 3)
-                        height: 1
-                    }
-
                     // Quick toggle for Herdr Desktop App (hc)
                     StyledRect {
                         id: hcChip
-                        height: hcRow.implicitHeight + Theme.spacingXS * 2
+                        height: searchBarRect.height
                         width: hcRow.implicitWidth + Theme.spacingS * 2
                         radius: Theme.cornerRadiusFull
                         color: root.includeHerdrCore ? Theme.withAlpha(Theme.primary, 0.22) : Theme.surfaceContainer
@@ -717,8 +875,8 @@ PluginComponent {
                     // Refresh button
                     StyledRect {
                         id: refreshBtn
-                        width: hcChip.height
-                        height: hcChip.height
+                        width: searchBarRect.height
+                        height: searchBarRect.height
                         radius: Theme.cornerRadiusFull
                         color: refreshMouse.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
 
@@ -735,101 +893,6 @@ PluginComponent {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.refreshNow()
-                        }
-                    }
-                }
-
-                // ── Live Search Bar ──
-                StyledRect {
-                    id: searchBarRect
-                    width: parent.width
-                    height: Theme.listItemHeight - Theme.spacingS
-                    radius: Theme.cornerRadius
-                    color: Theme.surfaceContainer
-                    border.width: Theme.outlineWidth
-                    border.color: searchInput.activeFocus ? Theme.primary : "transparent"
-
-                    DankIcon {
-                        id: searchBarIcon
-                        name: "search"
-                        size: Theme.iconSizeSmall
-                        color: searchInput.activeFocus ? Theme.primary : Theme.surfaceVariantText
-                        anchors.left: parent.left
-                        anchors.leftMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Item {
-                        anchors.left: searchBarIcon.right
-                        anchors.leftMargin: Theme.spacingXS
-                        anchors.right: clearSearchBtn.visible ? clearSearchBtn.left : parent.right
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.top: parent.top
-                        anchors.bottom: parent.bottom
-
-                        StyledText {
-                            visible: searchInput.text.length === 0
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            elide: Text.ElideRight
-                            text: I18n.trFor("herdrAgentMonitor", "Search agents, spaces, machines, cwd…")
-                            color: Theme.surfaceVariantText
-                            font.pixelSize: Theme.fontSizeSmall
-                        }
-
-                        TextInput {
-                            id: searchInput
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            anchors.verticalCenter: parent.verticalCenter
-                            clip: true
-                            selectByMouse: true
-                            color: Theme.surfaceText
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSizeSmall
-                            text: sharedSearchQuery.value || ""
-                            onTextChanged: {
-                                if ((sharedSearchQuery.value || "") !== text)
-                                    sharedSearchQuery.set(text);
-                            }
-                            onAccepted: {
-                                if (root.firstMatchingAgent) {
-                                    root.focusAgent(root.firstMatchingAgent);
-                                    popout.closePopout();
-                                }
-                            }
-                        }
-                    }
-
-                    StyledRect {
-                        id: clearSearchBtn
-                        visible: searchInput.text.length > 0
-                        width: Theme.iconSizeSmall + Theme.spacingS
-                        height: Theme.iconSizeSmall + Theme.spacingS
-                        radius: Theme.cornerRadiusFull
-                        anchors.right: parent.right
-                        anchors.rightMargin: Theme.spacingXS
-                        anchors.verticalCenter: parent.verticalCenter
-                        color: clearSearchMouse.containsMouse ? Theme.surfaceContainerHighest : "transparent"
-
-                        DankIcon {
-                            anchors.centerIn: parent
-                            name: "close"
-                            size: Theme.iconSizeSmall
-                            color: Theme.surfaceVariantText
-                        }
-
-                        MouseArea {
-                            id: clearSearchMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                searchInput.text = "";
-                                sharedSearchQuery.set("");
-                                searchInput.forceActiveFocus();
-                            }
                         }
                     }
                 }
@@ -927,15 +990,17 @@ PluginComponent {
                         spacing: Theme.spacingM
 
                         StyledText {
-                            visible: (root.totals.agents || 0) === 0 && !sharedRefreshing.value && !root.searchQuery
+                            visible: (root.totals.agents || 0) === 0 && !sharedRefreshing.value && !root.hasActiveFilter
                             text: I18n.trFor("herdrAgentMonitor", "No active agents across monitored machines")
                             color: Theme.surfaceVariantText
                             font.pixelSize: Theme.fontSizeMedium
                         }
 
                         StyledText {
-                            visible: root.searchQuery.length > 0 && root.matchingAgentCount === 0
-                            text: I18n.trFor("herdrAgentMonitor", "No agents match \"%1\"").arg(sharedSearchQuery.value || "")
+                            visible: root.hasActiveFilter && root.matchingAgentCount === 0
+                            text: root.searchQuery.length > 0
+                                ? I18n.trFor("herdrAgentMonitor", "No agents match \"%1\"").arg(sharedSearchQuery.value || "")
+                                : I18n.trFor("herdrAgentMonitor", "No %1 agents").arg(root.statusLabel(root.selectedStatus))
                             color: Theme.surfaceVariantText
                             font.pixelSize: Theme.fontSizeMedium
                         }
@@ -949,7 +1014,7 @@ PluginComponent {
                                 readonly property var visibleWorkspaces: root.filteredWorkspacesForMachine(machineBlock.modelData)
                                 width: treeColumn.width
                                 spacing: Theme.spacingXS
-                                visible: visibleWorkspaces.length > 0 || (!root.searchQuery && (!modelData.reachable || root.selectedMachine === modelData.id))
+                                visible: visibleWorkspaces.length > 0 || (!root.hasActiveFilter && (!modelData.reachable || root.selectedMachine === modelData.id))
 
                                 // Machine Header (shown when multiple machines exist or when local is unreachable)
                                 StyledRect {
@@ -994,7 +1059,7 @@ PluginComponent {
                                 }
 
                                 StyledText {
-                                    visible: !root.searchQuery && machineBlock.modelData.reachable && (!machineBlock.modelData.workspaces || machineBlock.modelData.workspaces.length === 0) && root.selectedMachine === machineBlock.modelData.id
+                                    visible: !root.hasActiveFilter && machineBlock.modelData.reachable && (!machineBlock.modelData.workspaces || machineBlock.modelData.workspaces.length === 0) && root.selectedMachine === machineBlock.modelData.id
                                     text: I18n.trFor("herdrAgentMonitor", "No active agents on this machine")
                                     color: Theme.surfaceVariantText
                                     font.pixelSize: Theme.fontSizeSmall
