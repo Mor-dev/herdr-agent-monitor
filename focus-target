@@ -63,14 +63,7 @@ import tempfile
 import time
 
 target_host = (sys.argv[1] or "").strip().lower()
-ws_label = (sys.argv[2] or "").strip()
-
-query_parts = [re.sub(r"[^a-z0-9]+", " ", target_host).strip()]
-if ws_label and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", ws_label):
-    ws_clean = re.sub(r"[^a-z0-9]+", " ", ws_label.lower()).strip()
-    if ws_clean:
-        query_parts.append(ws_clean)
-query_text = " ".join(p for p in query_parts if p)
+query_text = re.sub(r"[^a-z0-9]+", " ", target_host).strip()
 if not query_text:
     raise SystemExit(0)
 
@@ -221,7 +214,9 @@ for ch in query_text:
 
 time.sleep(0.015)
 tap(KEY_ENTER, 0.008)
-time.sleep(0.04)
+time.sleep(0.02)
+tap(KEY_ESC, 0.008)
+time.sleep(0.03)
 s.close()
 PY
 }
@@ -266,7 +261,7 @@ focus_niri_herdr_window() {
     local win_info win_id="" win_title=""
     win_info="$(
         jq -r --arg anc "$ancestor_pids" --arg thost "$target_host" '
-            def is_anc: (.pid != null) and ($anc | contains("," + (.pid | tostring) + ","));
+            def is_anc: (.pid != null) and ((.pid | tostring) as $p | ($anc | contains("," + $p + ",")));
             def title_lc: (.title // "" | ascii_downcase);
             def app_lc: (.app_id // "" | ascii_downcase);
             def matches_host: title_lc | startswith(($thost | ascii_downcase) + ": ");
