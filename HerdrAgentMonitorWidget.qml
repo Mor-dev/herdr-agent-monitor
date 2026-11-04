@@ -431,7 +431,8 @@ PluginComponent {
             agent.machine_id || "local",
             agent.pane_id || "",
             agent.workspace_id || "",
-            agent.tab_id || ""
+            agent.tab_id || "",
+            agent.workspace_label || ""
         ]);
     }
 
@@ -444,7 +445,9 @@ PluginComponent {
             "workspace",
             machine.backend || "herdr",
             machine.id || "local",
-            ws.workspace_id || ""
+            ws.workspace_id || "",
+            "",
+            ws.label || ""
         ]);
     }
 

@@ -3,8 +3,8 @@
 # or Herdr App (hc), and focuses the corresponding terminal or Herdr App window in Niri.
 #
 # Usage:
-#   focus-target agent <backend> <machine_id> <pane_id> [workspace_id] [tab_id]
-#   focus-target workspace <backend> <machine_id> <workspace_id> [tab_id]
+#   focus-target agent <backend> <machine_id> <pane_id> [workspace_id] [tab_id] [workspace_label]
+#   focus-target workspace <backend> <machine_id> <workspace_id> [tab_id] [workspace_label]
 #   focus-target window [backend] [machine_id]
 #   focus-target notification <summary> <body>
 #   focus-target reemit-notification <summary> <body>
@@ -18,6 +18,10 @@ machine="${3:-local}"
 target_id="${4:-}"
 workspace_id="${5:-}"
 tab_id="${6:-}"
+workspace_label="${7:-}"
+if [[ "$kind" == "workspace" && -z "$workspace_label" ]]; then
+    workspace_label="${6:-}"
+fi
 
 ensure_runtime_env() {
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -42,8 +46,190 @@ ensure_runtime_env() {
     fi
 }
 
+switch_herdr_tui_endpoint() {
+    local target_host="${1:-}"
+    local ws_label="${2:-}"
+    [[ -n "$target_host" ]] || return 0
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 0
+
+    python3 - "$target_host" "$ws_label" <<'PY' >/dev/null 2>&1 || true
+import ctypes
+import os
+import re
+import socket
+import struct
+import sys
+import tempfile
+import time
+
+target_host = (sys.argv[1] or "").strip().lower()
+ws_label = (sys.argv[2] or "").strip()
+
+query_parts = [re.sub(r"[^a-z0-9]+", " ", target_host).strip()]
+if ws_label and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", ws_label):
+    ws_clean = re.sub(r"[^a-z0-9]+", " ", ws_label.lower()).strip()
+    if ws_clean:
+        query_parts.append(ws_clean)
+query_text = " ".join(p for p in query_parts if p)
+if not query_text:
+    raise SystemExit(0)
+
+libxkb = ctypes.CDLL("libxkbcommon.so.0")
+libxkb.xkb_context_new.argtypes = [ctypes.c_int]
+libxkb.xkb_context_new.restype = ctypes.c_void_p
+libxkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+libxkb.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+libxkb.xkb_keymap_get_as_string.argtypes = [ctypes.c_void_p, ctypes.c_int]
+libxkb.xkb_keymap_get_as_string.restype = ctypes.c_char_p
+
+ctx = libxkb.xkb_context_new(0)
+kmap = libxkb.xkb_keymap_new_from_names(ctx, None, 0)
+keymap_bytes = libxkb.xkb_keymap_get_as_string(kmap, 1) + b"\x00"
+
+sock_path = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    os.environ.get("WAYLAND_DISPLAY", "wayland-1"),
+)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+
+
+def pack_msg(obj_id, opcode, payload=b""):
+    size = 8 + len(payload)
+    return struct.pack("<II", obj_id, (size << 16) | opcode) + payload
+
+
+def pack_str(st):
+    b = st.encode("utf-8") + b"\x00"
+    pad = (4 - (len(b) % 4)) % 4
+    return struct.pack("<I", len(b)) + b + (b"\x00" * pad)
+
+
+s.sendall(pack_msg(1, 1, struct.pack("<I", 2)) + pack_msg(1, 0, struct.pack("<I", 3)))
+buf = b""
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+    if len(buf) >= 8 and b"zwp_virtual_keyboard_manager_v1" in buf:
+        break
+
+vk_mgr_name = None
+seat_name = None
+off = 0
+while off + 8 <= len(buf):
+    oid, sz_op = struct.unpack("<II", buf[off : off + 8])
+    sz = sz_op >> 16
+    op = sz_op & 0xFFFF
+    body = buf[off + 8 : off + sz]
+    off += sz
+    if oid == 2 and op == 0:
+        name, slen = struct.unpack("<II", body[:8])
+        iface = body[8 : 8 + slen - 1].decode("utf-8", "replace")
+        if iface == "zwp_virtual_keyboard_manager_v1":
+            vk_mgr_name = name
+        elif iface == "wl_seat":
+            seat_name = name
+
+if not vk_mgr_name or not seat_name:
+    raise SystemExit(0)
+
+s.sendall(
+    pack_msg(2, 0, struct.pack("<I", seat_name) + pack_str("wl_seat") + struct.pack("<II", 1, 4))
+    + pack_msg(
+        2,
+        0,
+        struct.pack("<I", vk_mgr_name)
+        + pack_str("zwp_virtual_keyboard_manager_v1")
+        + struct.pack("<II", 1, 5),
+    )
+    + pack_msg(5, 0, struct.pack("<II", 4, 6))
+)
+
+with tempfile.TemporaryFile() as tf:
+    tf.write(keymap_bytes)
+    tf.flush()
+    msg = pack_msg(6, 0, struct.pack("<II", 1, len(keymap_bytes)))
+    s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("<i", tf.fileno()))])
+
+s.sendall(pack_msg(1, 0, struct.pack("<I", 7)))
+time.sleep(0.03)
+
+t0 = int(time.monotonic() * 1000) & 0xFFFFFFFF
+
+
+def send_key(kc, state):
+    global t0
+    t0 = (t0 + 4) & 0xFFFFFFFF
+    s.sendall(pack_msg(6, 1, struct.pack("<III", t0, kc, state)))
+
+
+def send_mods(depressed, latched=0, locked=0, group=0):
+    s.sendall(pack_msg(6, 2, struct.pack("<IIII", depressed, latched, locked, group)))
+
+
+def tap(kc, delay=0.004):
+    send_key(kc, 1)
+    time.sleep(delay)
+    send_key(kc, 0)
+    time.sleep(delay)
+
+
+KEY_ESC = 1
+KEY_ENTER = 28
+KEY_LEFTALT = 56
+KEY_W = 17
+KEY_SLASH = 53
+MOD_ALT = 8
+
+CHAR_MAP = {
+    "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34, "h": 35,
+    "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49, "o": 24, "p": 25,
+    "q": 16, "r": 19, "s": 31, "t": 20, "u": 22, "v": 47, "w": 17, "x": 45,
+    "y": 21, "z": 44, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7,
+    "7": 8, "8": 9, "9": 10, "0": 11, "-": 12, " ": 57,
+}
+
+# 1. Clear any active overlay or input mode
+tap(KEY_ESC, 0.008)
+tap(KEY_ESC, 0.008)
+time.sleep(0.02)
+
+# 2. Open workspace_picker (Alt+w)
+send_key(KEY_LEFTALT, 1)
+send_mods(MOD_ALT)
+time.sleep(0.01)
+send_key(KEY_W, 1)
+time.sleep(0.01)
+send_key(KEY_W, 0)
+time.sleep(0.01)
+send_key(KEY_LEFTALT, 0)
+send_mods(0)
+time.sleep(0.04)
+
+# 3. Focus search bar inside workspace_picker ('/')
+tap(KEY_SLASH, 0.008)
+time.sleep(0.015)
+
+# 4. Type normalized query and press Enter
+for ch in query_text:
+    kc = CHAR_MAP.get(ch)
+    if kc is not None:
+        tap(kc, 0.004)
+
+time.sleep(0.015)
+tap(KEY_ENTER, 0.008)
+time.sleep(0.04)
+s.close()
+PY
+}
+
 focus_niri_herdr_window() {
     local target_machine="${1:-local}"
+    local target_ws_label="${2:-}"
+    local allow_switch="${3:-0}"
     command -v niri >/dev/null 2>&1 || return 0
     command -v jq >/dev/null 2>&1 || return 0
 
@@ -77,8 +263,8 @@ focus_niri_herdr_window() {
         done
     done
 
-    local win_id
-    win_id="$(
+    local win_info win_id="" win_title=""
+    win_info="$(
         jq -r --arg anc "$ancestor_pids" --arg thost "$target_host" '
             def is_anc: (.pid != null) and ($anc | contains("," + (.pid | tostring) + ","));
             def title_lc: (.title // "" | ascii_downcase);
@@ -93,13 +279,24 @@ focus_niri_herdr_window() {
                 + [ .[] | select(matches_host) ]
                 + [ .[] | select((title_lc | contains("herdr")) or (app_lc | contains("herdr"))) ]
             )
-            | map(.id)
-            | first // empty
+            | first
+            | if . then "\(.id)\t\(.title // "")" else empty end
         ' <<<"$windows_json" 2>/dev/null
     )"
 
+    if [[ -n "$win_info" ]]; then
+        IFS=$'\t' read -r win_id win_title <<<"$win_info"
+    fi
+
     if [[ -n "$win_id" ]]; then
         niri msg action focus-window --id "$win_id" >/dev/null 2>&1 || true
+        if [[ "$allow_switch" == "1" ]]; then
+            local win_title_lc="${win_title,,}"
+            local target_host_lc="${target_host,,}"
+            if [[ "$win_title_lc" != "${target_host_lc}: "* ]]; then
+                switch_herdr_tui_endpoint "$target_host" "$target_ws_label"
+            fi
+        fi
     fi
 }
 
@@ -226,7 +423,7 @@ for m in machines:
         if ws_score > best_ws_score:
             best_ws_score = ws_score
             inferred_tab = f"{ws_id}:t{tab_num}" if (tab_num and m_backend == "herdr" and ws_id) else ""
-            best_ws = (m_backend, m_id, ws_id, inferred_tab)
+            best_ws = (m_backend, m_id, ws_id, inferred_tab, str(ws.get("label") or ""))
 
         for ag in ws.get("agents") or []:
             score = ws_score
@@ -256,6 +453,7 @@ for m in machines:
                     str(ag.get("pane_id") or ""),
                     ws_id,
                     ag_tab or (f"{ws_id}:t{tab_num}" if (tab_num and m_backend == "herdr" and ws_id) else ""),
+                    str(ws.get("label") or ""),
                 )
 
 if best_agent and best_agent_score >= 45:
@@ -268,16 +466,16 @@ PY
     )"
 
     if [[ -n "$resolved" ]]; then
-        local r_kind r_backend r_machine r_target r_ws r_tab
-        IFS=$'\t' read -r r_kind r_backend r_machine r_target r_ws r_tab <<<"$resolved"
+        local r_kind r_backend r_machine r_target r_ws r_tab r_ws_label
+        IFS=$'\t' read -r r_kind r_backend r_machine r_target r_ws r_tab r_ws_label <<<"$resolved"
         if [[ "$r_kind" == "agent" && -n "$r_target" ]]; then
-            exec "$0" agent "$r_backend" "$r_machine" "$r_target" "${r_ws:-}" "${r_tab:-}"
+            exec "$0" agent "$r_backend" "$r_machine" "$r_target" "${r_ws:-}" "${r_tab:-}" "${r_ws_label:-}"
         elif [[ "$r_kind" == "workspace" && -n "$r_target" ]]; then
-            exec "$0" workspace "$r_backend" "$r_machine" "$r_target" "${r_ws:-}"
+            exec "$0" workspace "$r_backend" "$r_machine" "$r_target" "${r_ws:-}" "${r_tab:-}"
         fi
     fi
 
-    focus_niri_herdr_window "local"
+    focus_niri_herdr_window "local" "" "0"
     exit 0
 }
 
@@ -312,7 +510,7 @@ if [[ "$kind" == "window" ]]; then
         ensure_hc_window_open
         focus_niri_hc_window
     else
-        focus_niri_herdr_window "$machine"
+        focus_niri_herdr_window "$machine" "" "0"
     fi
     exit 0
 fi
@@ -341,6 +539,8 @@ if [[ -n "$machine" && "$machine" != "local" ]]; then
     herdr_cmd=(herdr --machine "$machine")
 fi
 
+focus_niri_herdr_window "$machine" "$workspace_label" "1"
+
 if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
     "${herdr_cmd[@]}" workspace focus "$target_id" >/dev/null 2>&1 || true
     if [[ -n "$workspace_id" ]]; then
@@ -348,16 +548,14 @@ if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
         "${herdr_cmd[@]}" tab focus "$workspace_id" >/dev/null 2>&1 || true
     fi
 elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
-    if [[ -n "$workspace_id" ]]; then
-        "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
+    if ! "${herdr_cmd[@]}" agent focus "$target_id" >/dev/null 2>&1; then
+        if [[ -n "$workspace_id" ]]; then
+            "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "$tab_id" ]]; then
+            "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
+        fi
     fi
-    if [[ -n "$tab_id" ]]; then
-        "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
-    fi
-    "${herdr_cmd[@]}" agent focus "$target_id" >/dev/null 2>&1 \
-        || "${herdr_cmd[@]}" pane focus "$target_id" >/dev/null 2>&1 \
-        || true
 fi
 
-focus_niri_herdr_window "$machine"
 exit 0
