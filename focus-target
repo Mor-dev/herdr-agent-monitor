@@ -53,16 +53,28 @@ ensure_runtime_env() {
 wait_niri_window_focus() {
     local win_id="${1:-}"
     [[ -n "$win_id" ]] || return 0
-    local i focused_id
-    for i in {1..14}; do
+    local i focused_id blocking_layers
+    for i in {1..24}; do
+        blocking_layers="$(
+            niri msg -j layers 2>/dev/null | jq -r '
+                [ .[] | select(
+                    ((.keyboard_interactivity // "None" | tostring | ascii_downcase) == "exclusive")
+                    or (
+                        ((.namespace // "") | (startswith("dms:plugins:") or startswith("dms:popout") or startswith("dms:modal")))
+                        and ((.keyboard_interactivity // "None" | tostring | ascii_downcase) != "none")
+                    )
+                ) ] | length
+            ' 2>/dev/null || echo "0"
+        )"
         niri msg action focus-window --id "$win_id" >/dev/null 2>&1 || true
         focused_id="$(niri msg -j focused-window 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)"
-        if [[ "$focused_id" == "$win_id" ]]; then
-            sleep 0.03
+        if [[ "$focused_id" == "$win_id" && "${blocking_layers:-0}" == "0" ]]; then
+            sleep 0.08
             return 0
         fi
         sleep 0.025
     done
+    sleep 0.08
 }
 
 focus_herdr_pane_rpc() {
@@ -215,7 +227,7 @@ with tempfile.TemporaryFile() as tf:
     s.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("<i", tf.fileno()))])
 
 s.sendall(pack_msg(1, 0, struct.pack("<I", 7)))
-time.sleep(0.03)
+time.sleep(0.06)
 
 t0 = int(time.monotonic() * 1000) & 0xFFFFFFFF
 
@@ -261,7 +273,7 @@ send_key(KEY_W, 0)
 time.sleep(0.01)
 send_key(KEY_LEFTALT, 0)
 send_mods(0)
-time.sleep(0.04)
+time.sleep(0.06)
 
 # 2. Focus search bar inside workspace_picker ('/')
 tap(KEY_SLASH, 0.008)
@@ -351,12 +363,14 @@ focus_niri_herdr_window() {
             if [[ -n "$active_endpoint" ]]; then
                 if [[ "${active_endpoint,,}" != "${desired_endpoint,,}" ]]; then
                     switch_herdr_tui_endpoint "$desired_endpoint"
+                    HERDR_SWITCHED_ENDPOINT=1
                 fi
             else
                 local win_title_lc="${win_title,,}"
                 local target_host_lc="${target_host,,}"
                 if [[ "$win_title_lc" != "${target_host_lc}: "* ]]; then
                     switch_herdr_tui_endpoint "$desired_endpoint"
+                    HERDR_SWITCHED_ENDPOINT=1
                 fi
             fi
         fi
@@ -625,28 +639,48 @@ if [[ -n "$machine" && "$machine" != "local" ]]; then
     herdr_cmd=(herdr --machine "$machine")
 fi
 
-focus_niri_herdr_window "$machine" "$workspace_label" "1"
-
-if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
-    "${herdr_cmd[@]}" workspace focus "$target_id" >/dev/null 2>&1 || true
-    if [[ -n "$tab_id" ]]; then
-        "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$first_pane_id" ]]; then
-        focus_herdr_pane_rpc "$machine" "$first_pane_id" \
-            || "${herdr_cmd[@]}" agent focus "$first_pane_id" >/dev/null 2>&1 \
-            || true
-    fi
-elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
-    if [[ -n "$workspace_id" ]]; then
-        "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$tab_id" ]]; then
-        "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
-    fi
-    focus_herdr_pane_rpc "$machine" "$target_id" \
-        || "${herdr_cmd[@]}" agent focus "$target_id" >/dev/null 2>&1 \
+focus_herdr_pane() {
+    local target_machine="${1:-local}"
+    local pane_id="${2:-}"
+    [[ -n "$pane_id" ]] || return 0
+    "${herdr_cmd[@]}" agent focus "$pane_id" >/dev/null 2>&1 \
+        || focus_herdr_pane_rpc "$target_machine" "$pane_id" \
         || true
+}
+
+focus_herdr_target_on_server() {
+    if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
+        # Herdr 0.9.x: select target pane first, then move attached clients via workspace/tab focus
+        if [[ -n "$first_pane_id" ]]; then
+            focus_herdr_pane "$machine" "$first_pane_id"
+        fi
+        "${herdr_cmd[@]}" workspace focus "$target_id" >/dev/null 2>&1 || true
+        if [[ -n "$tab_id" ]]; then
+            "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "$first_pane_id" ]]; then
+            focus_herdr_pane "$machine" "$first_pane_id"
+        fi
+    elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
+        # Herdr 0.9.x: agent/pane focus sets server selection; tab focus moves attached clients and keeps it
+        focus_herdr_pane "$machine" "$target_id"
+        if [[ -n "$workspace_id" ]]; then
+            "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
+        fi
+        if [[ -n "$tab_id" ]]; then
+            "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
+        fi
+        focus_herdr_pane "$machine" "$target_id"
+    fi
+}
+
+HERDR_SWITCHED_ENDPOINT=0
+focus_niri_herdr_window "$machine" "$workspace_label" "1"
+focus_herdr_target_on_server
+
+if [[ "$HERDR_SWITCHED_ENDPOINT" == "1" ]]; then
+    sleep 0.35
+    focus_herdr_target_on_server
 fi
 
 exit 0

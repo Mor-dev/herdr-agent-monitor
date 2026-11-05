@@ -814,8 +814,10 @@ PluginComponent {
                                 }
                                 onAccepted: {
                                     if (root.firstMatchingAgent) {
+                                        searchInput.focus = false;
+                                        if (popout.parentPopout)
+                                            root.fleetPopout = popout.parentPopout;
                                         root.focusAgent(root.firstMatchingAgent);
-                                        popout.closePopout();
                                     }
                                 }
                             }
@@ -1144,8 +1146,10 @@ PluginComponent {
                                                 hoverEnabled: true
                                                 cursorShape: Qt.PointingHandCursor
                                                 onClicked: {
+                                                    searchInput.focus = false;
+                                                    if (popout.parentPopout)
+                                                        root.fleetPopout = popout.parentPopout;
                                                     root.focusWorkspace(machineBlock.modelData, wsBlock.modelData);
-                                                    popout.closePopout();
                                                 }
                                             }
                                         }
@@ -1247,8 +1251,10 @@ PluginComponent {
                                                     hoverEnabled: true
                                                     cursorShape: Qt.PointingHandCursor
                                                     onClicked: {
+                                                        searchInput.focus = false;
+                                                        if (popout.parentPopout)
+                                                            root.fleetPopout = popout.parentPopout;
                                                         root.focusAgent(agentCard.modelData);
-                                                        popout.closePopout();
                                                     }
                                                 }
                                             }
