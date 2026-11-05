@@ -173,18 +173,18 @@ def parse_herdr_snapshot(
             "agents": [],
         }
 
-    covered_panes: set[str] = set()
-    covered_terminals: set[str] = set()
+    agents_per_tab: dict[str, int] = {}
+    for a in raw_agents:
+        pane_id = a.get("pane_id") or ""
+        pane = pane_by_id.get(pane_id, {})
+        tid = str(a.get("tab_id") or pane.get("tab_id") or "").strip()
+        if tid:
+            agents_per_tab[tid] = agents_per_tab.get(tid, 0) + 1
 
     for a in raw_agents:
         pane_id = a.get("pane_id") or ""
         wid = a.get("workspace_id") or "default"
         pane = pane_by_id.get(pane_id, {})
-        if pane_id:
-            covered_panes.add(pane_id)
-        term_id = str(a.get("terminal_id") or pane.get("terminal_id") or "").strip()
-        if term_id:
-            covered_terminals.add(term_id)
         if wid not in ws_by_id:
             ws_order.append(wid)
             ws_by_id[wid] = {
@@ -204,6 +204,9 @@ def parse_herdr_snapshot(
         counts["total"] += 1
         counts[status] += 1
 
+        tab_id = str(a.get("tab_id") or pane.get("tab_id") or "").strip()
+        tab = tab_by_id.get(tab_id, {})
+        tab_label = str(tab.get("label") or "").strip()
         tokens = a.get("tokens") or pane.get("tokens") or {}
         pane_label = (pane.get("label") or "").strip()
         stripped_title = (
@@ -211,104 +214,37 @@ def parse_herdr_snapshot(
             or pane.get("terminal_title_stripped")
             or ""
         ).strip()
-        token_title = (tokens.get("title") or "").strip()
+        agent_name = str(a.get("agent") or "agent").strip()
 
-        display_title = stripped_title or pane_label or token_title or (a.get("agent") or "agent")
+        # Prefer pane_label when stripped_title is a generic banner like "π - user" or "Claude Code"
+        is_generic_banner = (
+            not stripped_title
+            or stripped_title.startswith("π -")
+            or stripped_title.lower() in ("claude code", agent_name.lower())
+        )
+        if not is_generic_banner:
+            display_title = stripped_title
+        else:
+            display_title = pane_label or stripped_title or (
+                tab_label if agents_per_tab.get(tab_id, 0) <= 1 and not tab_label.isdigit() else ""
+            ) or agent_name
+
         subtitle = ""
         if pane_label and pane_label != display_title:
             subtitle = pane_label
-        elif token_title and token_title != display_title:
-            subtitle = token_title
+        elif (
+            tab_label
+            and not tab_label.isdigit()
+            and tab_label != display_title
+            and agents_per_tab.get(tab_id, 0) <= 1
+        ):
+            subtitle = tab_label
+        elif stripped_title and stripped_title != display_title:
+            subtitle = stripped_title
 
         cwd = a.get("foreground_cwd") or a.get("cwd") or pane.get("cwd") or ""
         ws_info = ws_by_id[wid]
 
-        ws_info["agents"].append(
-            {
-                "key": f"herdr:{machine['id']}:{pane_id}",
-                "backend": "herdr",
-                "machine_id": machine["id"],
-                "machine_label": machine["label"],
-                "machine_short": machine["short_label"],
-                "is_local": machine["isLocal"],
-                "workspace_id": wid,
-                "workspace_number": ws_info["number"],
-                "workspace_label": ws_info["label"],
-                "tab_id": a.get("tab_id") or pane.get("tab_id") or "",
-                "pane_id": pane_id,
-                "agent": a.get("agent") or "agent",
-                "agent_status": status,
-                "title": display_title,
-                "subtitle": subtitle,
-                "cwd": shorten_cwd(cwd, home),
-                "context": (tokens.get("context") or "").strip(),
-                "limit": (tokens.get("limit") or "").strip(),
-                "cache": (tokens.get("cache_high") or "").strip(),
-                "focused": bool(a.get("focused", False) or pane.get("focused", False)),
-            }
-        )
-
-    # Also include non-agent panes from snap["panes"] so every herdr CLI pane is visible and focusable
-    for pane in raw_panes:
-        if not isinstance(pane, dict):
-            continue
-        pane_id = str(pane.get("pane_id") or "").strip()
-        if not pane_id or pane_id in covered_panes:
-            continue
-        term_id = str(pane.get("terminal_id") or "").strip()
-        if term_id and term_id in covered_terminals:
-            continue
-        covered_panes.add(pane_id)
-        if term_id:
-            covered_terminals.add(term_id)
-
-        wid = str(pane.get("workspace_id") or "default")
-        if wid not in ws_by_id:
-            ws_order.append(wid)
-            ws_by_id[wid] = {
-                "workspace_id": wid,
-                "number": len(ws_order),
-                "label": wid,
-                "focused": False,
-                "pane_count": 1,
-                "tab_count": 1,
-                "agent_status": "idle",
-                "agents": [],
-            }
-
-        raw_st = str(pane.get("agent_status") or "").lower()
-        status = raw_st if raw_st in ("blocked", "working", "idle", "done") else "idle"
-        counts["total"] += 1
-        counts[status] += 1
-
-        tab_id = str(pane.get("tab_id") or "").strip()
-        tab = tab_by_id.get(tab_id, {})
-        tab_label = str(tab.get("label") or "").strip()
-        pane_label = str(pane.get("label") or "").strip()
-        stripped_title = str(
-            pane.get("terminal_title_stripped")
-            or pane.get("terminal_title")
-            or ""
-        ).strip()
-        tokens = pane.get("tokens") or {}
-        token_title = str(tokens.get("title") or "").strip()
-
-        agent_name = str(pane.get("agent") or "").strip()
-        if not agent_name:
-            if pane_label and len(pane_label) <= 14 and " " not in pane_label:
-                agent_name = pane_label.lower()
-            else:
-                agent_name = "shell"
-
-        display_title = stripped_title or pane_label or token_title or tab_label or ws_by_id[wid]["label"] or pane_id
-        subtitle = ""
-        if pane_label and pane_label != display_title:
-            subtitle = pane_label
-        elif tab_label and tab_label != display_title:
-            subtitle = tab_label
-
-        cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
-        ws_info = ws_by_id[wid]
         ws_info["agents"].append(
             {
                 "key": f"herdr:{machine['id']}:{pane_id}",
@@ -327,10 +263,10 @@ def parse_herdr_snapshot(
                 "title": display_title,
                 "subtitle": subtitle,
                 "cwd": shorten_cwd(cwd, home),
-                "context": str(tokens.get("context") or "").strip(),
-                "limit": str(tokens.get("limit") or "").strip(),
-                "cache": str(tokens.get("cache_high") or "").strip(),
-                "focused": bool(pane.get("focused", False)),
+                "context": (tokens.get("context") or "").strip(),
+                "limit": (tokens.get("limit") or "").strip(),
+                "cache": (tokens.get("cache_high") or "").strip(),
+                "focused": bool(a.get("focused", False) or pane.get("focused", False)),
             }
         )
 
@@ -704,6 +640,16 @@ def fetch_hc_machines(
                             ag["cwd"] = ws_folder
                         ws_agents.append(ag)
 
+            real_hc_agents = [
+                ag for ag in ws_agents
+                if ag["agent"].lower() not in ("shell", "zsh", "bash", "fish", "sh")
+                or bool(merged_terms.get(ag["pane_id"], {}).get("status"))
+            ]
+            if real_hc_agents:
+                ws_agents = real_hc_agents
+            elif len(ws_agents) > 1:
+                ws_agents = ws_agents[:1]
+
             ws_agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
             if ws_agents or include_empty_spaces:
                 ws_status = ws_agents[0]["agent_status"] if ws_agents else "none"
@@ -763,6 +709,15 @@ def fetch_hc_machines(
             )
             if ag is not None:
                 ws_agents.append(ag)
+        real_hc_agents = [
+            ag for ag in ws_agents
+            if ag["agent"].lower() not in ("shell", "zsh", "bash", "fish", "sh")
+            or bool(merged_terms.get(ag["pane_id"], {}).get("status"))
+        ]
+        if real_hc_agents:
+            ws_agents = real_hc_agents
+        elif len(ws_agents) > 1:
+            ws_agents = ws_agents[:1]
         ws_agents.sort(key=lambda item: (STATUS_PRIORITY.get(item["agent_status"], 9), item["pane_id"]))
         if ws_agents:
             spaces_by_host[host_key].append(

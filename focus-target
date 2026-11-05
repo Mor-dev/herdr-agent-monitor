@@ -90,13 +90,36 @@ PY
     return 1
 }
 
+current_herdr_tui_endpoint() {
+    python3 - <<'PY' 2>/dev/null || true
+import json, os
+base = os.path.expanduser("~/.local/state/herdr/client")
+sel_path = os.path.join(base, "endpoint-selection.json")
+ep_path = os.path.join(base, "endpoints.json")
+if not os.path.isfile(sel_path):
+    raise SystemExit(0)
+with open(sel_path, "r", encoding="utf-8") as fh:
+    sel = json.load(fh)
+prof_id = sel.get("selected_profile")
+if not prof_id:
+    print("local")
+    raise SystemExit(0)
+if os.path.isfile(ep_path):
+    with open(ep_path, "r", encoding="utf-8") as fh:
+        ep = json.load(fh)
+    for item in ep.get("ssh") or []:
+        if isinstance(item, dict) and item.get("id") == prof_id:
+            print(str(item.get("label") or "").strip())
+            raise SystemExit(0)
+PY
+}
+
 switch_herdr_tui_endpoint() {
-    local target_host="${1:-}"
-    local ws_label="${2:-}"
-    [[ -n "$target_host" ]] || return 0
+    local target_endpoint="${1:-}"
+    [[ -n "$target_endpoint" ]] || return 0
     [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 0
 
-    python3 - "$target_host" "$ws_label" <<'PY' >/dev/null 2>&1 || true
+    python3 - "$target_endpoint" <<'PY' >/dev/null 2>&1 || true
 import ctypes
 import os
 import re
@@ -106,8 +129,8 @@ import sys
 import tempfile
 import time
 
-target_host = (sys.argv[1] or "").strip().lower()
-query_text = re.sub(r"[^a-z0-9]+", " ", target_host).strip()
+target_endpoint = (sys.argv[1] or "").strip().lower()
+query_text = re.sub(r"[^a-z0-9]+", " ", target_endpoint).strip()
 if not query_text:
     raise SystemExit(0)
 
@@ -214,7 +237,6 @@ def tap(kc, delay=0.004):
     time.sleep(delay)
 
 
-KEY_ESC = 1
 KEY_ENTER = 28
 KEY_LEFTALT = 56
 KEY_W = 17
@@ -229,12 +251,7 @@ CHAR_MAP = {
     "7": 8, "8": 9, "9": 10, "0": 11, "-": 12, " ": 57,
 }
 
-# 1. Clear any active overlay or input mode
-tap(KEY_ESC, 0.008)
-tap(KEY_ESC, 0.008)
-time.sleep(0.02)
-
-# 2. Open workspace_picker (Alt+w)
+# 1. Open workspace_picker (Alt+w) without sending ESC into the active PTY
 send_key(KEY_LEFTALT, 1)
 send_mods(MOD_ALT)
 time.sleep(0.01)
@@ -246,11 +263,11 @@ send_key(KEY_LEFTALT, 0)
 send_mods(0)
 time.sleep(0.04)
 
-# 3. Focus search bar inside workspace_picker ('/')
+# 2. Focus search bar inside workspace_picker ('/')
 tap(KEY_SLASH, 0.008)
 time.sleep(0.015)
 
-# 4. Type normalized query and press Enter
+# 3. Type normalized endpoint query ("local" or profile label) and press Enter
 for ch in query_text:
     kc = CHAR_MAP.get(ch)
     if kc is not None:
@@ -258,8 +275,6 @@ for ch in query_text:
 
 time.sleep(0.015)
 tap(KEY_ENTER, 0.008)
-time.sleep(0.02)
-tap(KEY_ESC, 0.008)
 time.sleep(0.03)
 s.close()
 PY
@@ -276,17 +291,18 @@ focus_niri_herdr_window() {
     windows_json="$(niri msg -j windows 2>/dev/null)" || return 0
     [[ -n "$windows_json" ]] || return 0
 
-    local target_host="$target_machine"
-    if [[ "$target_machine" == "local" || -z "$target_machine" ]]; then
+    local desired_endpoint="${target_machine:-local}"
+    local target_host="$desired_endpoint"
+    if [[ "$desired_endpoint" == "local" ]]; then
         target_host="$(hostname 2>/dev/null || echo "local")"
     fi
 
-    # Collect ancestor PIDs of active herdr client processes (excluding background `herdr server`)
+    # Collect ancestor PIDs of active herdr TUI client processes (excluding server and remote bridges)
     local herdr_pids client_pids="" p cmd cur ancestor_pids=","
     herdr_pids="$(pgrep -x herdr 2>/dev/null || true)"
     for p in $herdr_pids; do
         cmd="$(ps -o args= -p "$p" 2>/dev/null || true)"
-        if [[ "$cmd" != *"herdr server"* ]]; then
+        if [[ "$cmd" != *"herdr server"* && "$cmd" != *"remote-client-bridge"* ]]; then
             client_pids="$client_pids $p"
         fi
     done
@@ -316,7 +332,7 @@ focus_niri_herdr_window() {
                 + [ .[] | select(is_anc and looks_like_herdr) ]
                 + [ .[] | select(is_anc) ]
                 + [ .[] | select(matches_host) ]
-                + [ .[] | select((title_lc | contains("herdr")) or (app_lc | contains("herdr"))) ]
+                + [ .[] | select(looks_like_herdr) ]
             )
             | first
             | if . then "\(.id)\t\(.title // "")" else empty end
@@ -330,10 +346,18 @@ focus_niri_herdr_window() {
     if [[ -n "$win_id" ]]; then
         wait_niri_window_focus "$win_id"
         if [[ "$allow_switch" == "1" ]]; then
-            local win_title_lc="${win_title,,}"
-            local target_host_lc="${target_host,,}"
-            if [[ "$win_title_lc" != "${target_host_lc}: "* ]]; then
-                switch_herdr_tui_endpoint "$target_host" "$target_ws_label"
+            local active_endpoint
+            active_endpoint="$(current_herdr_tui_endpoint)"
+            if [[ -n "$active_endpoint" ]]; then
+                if [[ "${active_endpoint,,}" != "${desired_endpoint,,}" ]]; then
+                    switch_herdr_tui_endpoint "$desired_endpoint"
+                fi
+            else
+                local win_title_lc="${win_title,,}"
+                local target_host_lc="${target_host,,}"
+                if [[ "$win_title_lc" != "${target_host_lc}: "* ]]; then
+                    switch_herdr_tui_endpoint "$desired_endpoint"
+                fi
             fi
         fi
     fi
