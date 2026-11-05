@@ -7,10 +7,12 @@ A [DankMaterialShell](https://danklinux.com) bar widget that monitors live agent
 ## Features
 
 - **Single-Machine & Multi-Machine Ready**: Works out of the box with a single local `herdr` instance (hiding machine filters and headers when only `local` is present), and automatically discovers enabled SSH machines from `herdr machine list` (`herdr --machine <host> api snapshot`) and `hc` machines when configured.
-- **Workspace & Agent Tree**: Groups agents by workspace/space with context token usage (`⛁ 68% (325k)`), rate-limit status (`5h 100%`), stripped terminal title, and live state (`blocked`, `working`, `idle`, `done`).
+- **Full Workspace, Agent & Pane Tree**: Groups all active agents and live terminal panes (`herdr` CLI panes and `Herdr App` / `hc` space terminals) by workspace/space with context token usage (`⛁ 68% (325k)`), rate-limit status (`5h 100%`), stripped terminal title, and live state (`blocked`, `working`, `idle`, `done`).
+- **Interactive Status Filter Pills & Live Search**: Click the top `blocked`, `working`, `idle`, or `done` summary pills to filter the fleet by status (click again to reset), and use the live multi-token search bar to filter across agent names, titles, pane IDs, workspaces, machines, and working directories (`Enter` focuses the first match).
 - **Herdr Desktop App (`hc`) Multi-Machine & Space Support**: Built-in setting and one-click `hc` chip in the popout header to monitor `herdr-core` / `herdr-app` across local and remote `hc` machines (`herdr-app ls`, `~/.local/state/herdr-core/default`, `hc get <addr> --json`, and `hc ls --json`).
 - **Multi-Row Machine Filter Chips**: Wrapping multi-row filter pills (`All`, `herdr` machines, and `hc · <host>` machines) with live counts and status indicator dots.
-- **One-Click Focus**: Click an agent card to focus its pane (`herdr [--machine <host>] agent focus <pane_id>` or `herdr-app do agent.focus --terminal <addr>`) or click a workspace header to focus that space (`herdr [--machine <host>] workspace focus <ws_id>` or `herdr-app do space.select --id <space_id>`). On Niri, also focuses the `herdr` / `herdr-app` window (or middle-click the bar pill).
+- **One-Click Focus & Cross-Machine TUI Switching**: Click any agent/pane card or workspace header to focus the corresponding `herdr` TUI terminal or `herdr-app` window in Niri, automatically switch the active `herdr` TUI client endpoint when jumping between machines, and focus the exact workspace/space, tab, and pane (`pane.focus` RPC / `herdr agent focus` / `herdr-app do pane.focus`).
+- **Clickable Herdr Notifications**: Intercepts `Herdr` notifications in DankMaterialShell (`NotificationService`) and re-emits them with a default click action that resolves and focuses the originating machine, workspace, tab, and pane.
 - **IPC Commands**:
   ```bash
   dms ipc call herdrAgentMonitor toggle
