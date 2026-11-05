@@ -148,10 +148,12 @@ def parse_herdr_snapshot(
 
     snap = data["result"]["snapshot"]
     raw_workspaces = snap.get("workspaces") or []
+    raw_tabs = snap.get("tabs") or []
     raw_panes = snap.get("panes") or []
     raw_agents = deduplicate_herdr_agents(snap.get("agents") or [])
 
-    pane_by_id = {p.get("pane_id"): p for p in raw_panes if p.get("pane_id")}
+    tab_by_id = {t.get("tab_id"): t for t in raw_tabs if isinstance(t, dict) and t.get("tab_id")}
+    pane_by_id = {p.get("pane_id"): p for p in raw_panes if isinstance(p, dict) and p.get("pane_id")}
     ws_by_id: dict[str, dict[str, Any]] = {}
     ws_order: list[str] = []
 
@@ -171,10 +173,18 @@ def parse_herdr_snapshot(
             "agents": [],
         }
 
+    covered_panes: set[str] = set()
+    covered_terminals: set[str] = set()
+
     for a in raw_agents:
         pane_id = a.get("pane_id") or ""
         wid = a.get("workspace_id") or "default"
         pane = pane_by_id.get(pane_id, {})
+        if pane_id:
+            covered_panes.add(pane_id)
+        term_id = str(a.get("terminal_id") or pane.get("terminal_id") or "").strip()
+        if term_id:
+            covered_terminals.add(term_id)
         if wid not in ws_by_id:
             ws_order.append(wid)
             ws_by_id[wid] = {
@@ -234,7 +244,93 @@ def parse_herdr_snapshot(
                 "context": (tokens.get("context") or "").strip(),
                 "limit": (tokens.get("limit") or "").strip(),
                 "cache": (tokens.get("cache_high") or "").strip(),
-                "focused": bool(a.get("focused", False)),
+                "focused": bool(a.get("focused", False) or pane.get("focused", False)),
+            }
+        )
+
+    # Also include non-agent panes from snap["panes"] so every herdr CLI pane is visible and focusable
+    for pane in raw_panes:
+        if not isinstance(pane, dict):
+            continue
+        pane_id = str(pane.get("pane_id") or "").strip()
+        if not pane_id or pane_id in covered_panes:
+            continue
+        term_id = str(pane.get("terminal_id") or "").strip()
+        if term_id and term_id in covered_terminals:
+            continue
+        covered_panes.add(pane_id)
+        if term_id:
+            covered_terminals.add(term_id)
+
+        wid = str(pane.get("workspace_id") or "default")
+        if wid not in ws_by_id:
+            ws_order.append(wid)
+            ws_by_id[wid] = {
+                "workspace_id": wid,
+                "number": len(ws_order),
+                "label": wid,
+                "focused": False,
+                "pane_count": 1,
+                "tab_count": 1,
+                "agent_status": "idle",
+                "agents": [],
+            }
+
+        raw_st = str(pane.get("agent_status") or "").lower()
+        status = raw_st if raw_st in ("blocked", "working", "idle", "done") else "idle"
+        counts["total"] += 1
+        counts[status] += 1
+
+        tab_id = str(pane.get("tab_id") or "").strip()
+        tab = tab_by_id.get(tab_id, {})
+        tab_label = str(tab.get("label") or "").strip()
+        pane_label = str(pane.get("label") or "").strip()
+        stripped_title = str(
+            pane.get("terminal_title_stripped")
+            or pane.get("terminal_title")
+            or ""
+        ).strip()
+        tokens = pane.get("tokens") or {}
+        token_title = str(tokens.get("title") or "").strip()
+
+        agent_name = str(pane.get("agent") or "").strip()
+        if not agent_name:
+            if pane_label and len(pane_label) <= 14 and " " not in pane_label:
+                agent_name = pane_label.lower()
+            else:
+                agent_name = "shell"
+
+        display_title = stripped_title or pane_label or token_title or tab_label or ws_by_id[wid]["label"] or pane_id
+        subtitle = ""
+        if pane_label and pane_label != display_title:
+            subtitle = pane_label
+        elif tab_label and tab_label != display_title:
+            subtitle = tab_label
+
+        cwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "")
+        ws_info = ws_by_id[wid]
+        ws_info["agents"].append(
+            {
+                "key": f"herdr:{machine['id']}:{pane_id}",
+                "backend": "herdr",
+                "machine_id": machine["id"],
+                "machine_label": machine["label"],
+                "machine_short": machine["short_label"],
+                "is_local": machine["isLocal"],
+                "workspace_id": wid,
+                "workspace_number": ws_info["number"],
+                "workspace_label": ws_info["label"],
+                "tab_id": tab_id,
+                "pane_id": pane_id,
+                "agent": agent_name,
+                "agent_status": status,
+                "title": display_title,
+                "subtitle": subtitle,
+                "cwd": shorten_cwd(cwd, home),
+                "context": str(tokens.get("context") or "").strip(),
+                "limit": str(tokens.get("limit") or "").strip(),
+                "cache": str(tokens.get("cache_high") or "").strip(),
+                "focused": bool(pane.get("focused", False)),
             }
         )
 
@@ -407,16 +503,19 @@ def fetch_hc_machines(
         st_app = st_obj.get("app") if isinstance(st_obj, dict) else None
         st_msg = st_obj.get("msg") if isinstance(st_obj, dict) else None
         labels = item.get("labels") or {}
+        fg = item.get("foreground") if isinstance(item.get("foreground"), dict) else {}
+        fg_name = str(fg.get("name") or "").strip()
         merged_terms[addr] = {
             "address": addr,
-            "agent": st_app or item.get("agent") or "",
+            "agent": st_app or item.get("agent") or fg_name or "",
             "status": str(st_state).lower() if st_state else "",
             "title": str(item.get("title") or "").strip(),
             "msg": str(st_msg or "").strip(),
-            "cwd": str(item.get("cwd") or ""),
+            "cwd": str(fg.get("cwd") or item.get("cwd") or ""),
             "turn": item.get("turn"),
             "where": str(labels.get("where") or "").strip(),
             "space_id": str(labels.get("herdr.space") or "").strip(),
+            "tab_id": str(labels.get("herdr.tab") or "").strip(),
         }
 
     if hc_data and isinstance(hc_data.get("terminals"), list):
@@ -442,6 +541,7 @@ def fetch_hc_machines(
                 "turn": t.get("turn") if t.get("turn") is not None else existing.get("turn"),
                 "where": str(t.get("where") or existing.get("where") or "").strip(),
                 "space_id": existing.get("space_id") or "",
+                "tab_id": existing.get("tab_id") or "",
             }
 
     # If herdr-app ls reports remote terminals not in local terminals.json, fetch their metadata via hc get
@@ -463,21 +563,30 @@ def fetch_hc_machines(
                 st_app = st_obj.get("app") if isinstance(st_obj, dict) else None
                 st_msg = st_obj.get("msg") if isinstance(st_obj, dict) else None
                 labels = t_detail.get("labels") or {}
+                fg = t_detail.get("foreground") if isinstance(t_detail.get("foreground"), dict) else {}
+                fg_name = str(fg.get("name") or "").strip()
                 merged_terms[addr] = {
                     "address": addr,
-                    "agent": st_app or t_detail.get("agent") or "",
+                    "agent": st_app or t_detail.get("agent") or fg_name or "",
                     "status": str(st_state).lower() if st_state else "",
                     "title": str(t_detail.get("title") or "").strip(),
                     "msg": str(st_msg or "").strip(),
-                    "cwd": str(t_detail.get("cwd") or ""),
+                    "cwd": str(fg.get("cwd") or t_detail.get("cwd") or ""),
                     "turn": t_detail.get("turn"),
                     "where": str(labels.get("where") or "").strip(),
                     "space_id": str(labels.get("herdr.space") or "").strip(),
+                    "tab_id": str(labels.get("herdr.tab") or "").strip(),
                 }
 
     # Track spaces per hc_host
     spaces_by_host: dict[str, list[dict[str, Any]]] = {h: [] for h in hc_hosts_order}
     assigned_addrs: set[str] = set()
+
+    def normalize_hc_id(raw_id: str, host_key: str) -> str:
+        val = (raw_id or "").strip()
+        if not val or host_key == "local" or "/" in val or val.startswith("hc-"):
+            return val
+        return f"{host_key}/{val}"
 
     def build_hc_agent(
         addr: str,
@@ -493,12 +602,16 @@ def fetch_hc_machines(
     ) -> dict[str, Any] | None:
         tinfo = merged_terms.get(addr, {})
         raw_status = (fallback_status or tinfo.get("status") or "").lower()
-        if not raw_status:
-            return None
-        status = raw_status if raw_status in STATUS_PRIORITY else "unknown"
-        agent_name = fallback_app or tinfo.get("agent") or "agent"
-        if agent_name in ("zsh", "bash", "fish", "nu", "sh") and not raw_status:
-            return None
+        if raw_status == "error":
+            status = "blocked"
+        elif raw_status in ("blocked", "working", "idle", "done"):
+            status = raw_status
+        else:
+            status = "idle"
+
+        agent_name = (fallback_app or tinfo.get("agent") or "shell").strip()
+        norm_ws_id = normalize_hc_id(ws_id or str(tinfo.get("space_id") or ""), host_key)
+        norm_tab_id = normalize_hc_id(tab_id or str(tinfo.get("tab_id") or ""), host_key)
 
         raw_title = fallback_name or tinfo.get("title") or ""
         clean_title = strip_agent_title(raw_title)
@@ -519,10 +632,10 @@ def fetch_hc_machines(
             "machine_label": hmeta["label"],
             "machine_short": hmeta["short_label"],
             "is_local": hmeta["isLocal"],
-            "workspace_id": ws_id,
+            "workspace_id": norm_ws_id,
             "workspace_number": ws_num,
             "workspace_label": ws_label,
-            "tab_id": tab_id,
+            "tab_id": norm_tab_id,
             "pane_id": addr,
             "agent": agent_name,
             "agent_status": status,
@@ -557,7 +670,7 @@ def fetch_hc_machines(
 
             host_ws_counter[sp_machine] = host_ws_counter.get(sp_machine, 0) + 1
             ws_num = host_ws_counter[sp_machine]
-            ws_id = str(sp.get("id") or f"hc-space-{ws_num}")
+            ws_id = normalize_hc_id(str(sp.get("id") or f"hc-space-{ws_num}"), sp_machine)
             ws_label = str(sp.get("name") or ws_id).strip()
             ws_focused = bool(sp.get("active"))
             ws_folder = shorten_cwd(str(sp.get("folder") or ""), home)
@@ -566,7 +679,7 @@ def fetch_hc_machines(
             pane_count = 0
             tabs = sp.get("tabs") or []
             for tab in tabs:
-                tab_id = str(tab.get("id") or "")
+                tab_id = normalize_hc_id(str(tab.get("id") or ""), sp_machine)
                 tab_active = bool(tab.get("active"))
                 for term_entry in tab.get("terminals") or []:
                     pane_count += 1
@@ -607,12 +720,12 @@ def fetch_hc_machines(
                     }
                 )
 
-    # Also include any remaining live agent terminals from hc ls / terminals.json not covered by herdr-app ls
+    # Also include any remaining live terminals in spaces from hc ls / terminals.json not covered by herdr-app ls
     fallback_groups: dict[tuple[str, str], list[str]] = {}
     for addr, tinfo in merged_terms.items():
         if addr in assigned_addrs:
             continue
-        if not tinfo.get("status"):
+        if not (tinfo.get("status") or tinfo.get("where") or tinfo.get("space_id")):
             continue
         host_key = addr.split("/", 1)[0] if "/" in addr else "local"
         if host_key not in hc_host_info:
@@ -634,16 +747,18 @@ def fetch_hc_machines(
     for (host_key, space_name), addrs in fallback_groups.items():
         ws_num = len(spaces_by_host[host_key]) + 1
         first_info = merged_terms.get(addrs[0], {})
-        ws_id = first_info.get("space_id") or f"hc-{host_key}-{ws_num}"
+        raw_sp_id = str(first_info.get("space_id") or "")
+        ws_id = normalize_hc_id(raw_sp_id, host_key) if raw_sp_id else f"hc-{host_key}-{ws_num}"
         ws_agents = []
         for addr in addrs:
+            tinfo = merged_terms.get(addr, {})
             ag = build_hc_agent(
                 addr=addr,
                 host_key=host_key,
                 ws_id=ws_id,
                 ws_num=ws_num,
                 ws_label=space_name,
-                tab_id="",
+                tab_id=str(tinfo.get("tab_id") or ""),
                 focused=False,
             )
             if ag is not None:

@@ -420,9 +420,18 @@ PluginComponent {
         root.runCollector(true);
     }
 
+    function closePopoutImmediately() {
+        if (root.fleetPopout && typeof root.fleetPopout.instantClose === "function") {
+            root.fleetPopout.instantClose();
+            return;
+        }
+        root.closePopout();
+    }
+
     function focusAgent(agent) {
         if (!agent || !root.pluginDir)
             return;
+        root.closePopoutImmediately();
         Quickshell.execDetached([
             "bash",
             root.focusScript,
@@ -439,6 +448,10 @@ PluginComponent {
     function focusWorkspace(machine, ws) {
         if (!machine || !ws || !root.pluginDir)
             return;
+        var agList = ws.agents || [];
+        var firstTab = agList.length > 0 ? (agList[0].tab_id || "") : "";
+        var firstPane = agList.length > 0 ? (agList[0].pane_id || "") : "";
+        root.closePopoutImmediately();
         Quickshell.execDetached([
             "bash",
             root.focusScript,
@@ -446,14 +459,16 @@ PluginComponent {
             machine.backend || "herdr",
             machine.id || "local",
             ws.workspace_id || "",
-            "",
-            ws.label || ""
+            firstTab,
+            ws.label || "",
+            firstPane
         ]);
     }
 
     function focusHerdrWindow() {
         if (!root.pluginDir)
             return;
+        root.closePopoutImmediately();
         Quickshell.execDetached(["bash", root.focusScript, "window"]);
     }
 

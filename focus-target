@@ -19,11 +19,15 @@ target_id="${4:-}"
 workspace_id="${5:-}"
 tab_id="${6:-}"
 workspace_label="${7:-}"
-if [[ "$kind" == "workspace" && -z "$workspace_label" ]]; then
+first_pane_id=""
+if [[ "$kind" == "workspace" ]]; then
+    tab_id="${5:-}"
     workspace_label="${6:-}"
+    first_pane_id="${7:-}"
 fi
 
 ensure_runtime_env() {
+    export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
         local wsock
@@ -44,6 +48,46 @@ ensure_runtime_env() {
             fi
         done
     fi
+}
+
+wait_niri_window_focus() {
+    local win_id="${1:-}"
+    [[ -n "$win_id" ]] || return 0
+    local i focused_id
+    for i in {1..14}; do
+        niri msg action focus-window --id "$win_id" >/dev/null 2>&1 || true
+        focused_id="$(niri msg -j focused-window 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)"
+        if [[ "$focused_id" == "$win_id" ]]; then
+            sleep 0.03
+            return 0
+        fi
+        sleep 0.025
+    done
+}
+
+focus_herdr_pane_rpc() {
+    local target_machine="${1:-local}"
+    local pane_id="${2:-}"
+    [[ -n "$pane_id" ]] || return 1
+    if [[ -z "$target_machine" || "$target_machine" == "local" ]]; then
+        python3 - "$pane_id" <<'PY' >/dev/null 2>&1
+import json, os, socket, sys
+pane_id = sys.argv[1]
+sock_path = os.path.expanduser("~/.config/herdr/herdr.sock")
+if not os.path.exists(sock_path):
+    raise SystemExit(1)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.0)
+s.connect(sock_path)
+s.sendall((json.dumps({"id": "1", "method": "pane.focus", "params": {"pane_id": pane_id}}) + "\n").encode())
+resp = s.recv(4096).decode("utf-8", "replace")
+s.close()
+if '"error"' in resp:
+    raise SystemExit(1)
+PY
+        return $?
+    fi
+    return 1
 }
 
 switch_herdr_tui_endpoint() {
@@ -284,7 +328,7 @@ focus_niri_herdr_window() {
     fi
 
     if [[ -n "$win_id" ]]; then
-        niri msg action focus-window --id "$win_id" >/dev/null 2>&1 || true
+        wait_niri_window_focus "$win_id"
         if [[ "$allow_switch" == "1" ]]; then
             local win_title_lc="${win_title,,}"
             local target_host_lc="${target_host,,}"
@@ -315,7 +359,7 @@ focus_niri_hc_window() {
         ' <<<"$windows_json" 2>/dev/null | head -n1
     )"
     if [[ -n "$win_id" ]]; then
-        niri msg action focus-window --id "$win_id" >/dev/null 2>&1 || true
+        wait_niri_window_focus "$win_id"
     fi
 }
 
@@ -512,17 +556,40 @@ fi
 
 if [[ "$backend" == "hc" ]]; then
     ensure_hc_window_open
+    hc_host="${machine#hc:}"
+    hc_prefix=""
+    if [[ -n "$hc_host" && "$hc_host" != "local" ]]; then
+        hc_prefix="${hc_host}/"
+    fi
     if [[ "$kind" == "workspace" && -n "$target_id" && "$target_id" != "unassigned" ]]; then
-        herdr-app do space.select --id "$target_id" >/dev/null 2>&1 || true
-    elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
-        if [[ -n "$workspace_id" && "$workspace_id" != "unassigned" ]]; then
-            herdr-app do space.select --id "$workspace_id" >/dev/null 2>&1 || true
+        if [[ "$target_id" != hc-* ]]; then
+            herdr-app do space.select --id "$target_id" >/dev/null 2>&1 \
+                || ([[ -n "$hc_prefix" && "$target_id" != *"/"* ]] && herdr-app do space.select --id "${hc_prefix}${target_id}" >/dev/null 2>&1) \
+                || true
         fi
         if [[ -n "$tab_id" ]]; then
-            herdr-app do tab.select --id "$tab_id" >/dev/null 2>&1 || true
+            herdr-app do tab.select --id "$tab_id" >/dev/null 2>&1 \
+                || ([[ -n "$hc_prefix" && "$tab_id" != *"/"* ]] && herdr-app do tab.select --id "${hc_prefix}${tab_id}" >/dev/null 2>&1) \
+                || true
         fi
-        herdr-app do agent.focus --terminal "$target_id" >/dev/null 2>&1 \
-            || herdr-app do pane.focus --terminal "$target_id" >/dev/null 2>&1 \
+        if [[ -n "$first_pane_id" ]]; then
+            herdr-app do pane.focus --terminal "$first_pane_id" >/dev/null 2>&1 \
+                || herdr-app do agent.focus --terminal "$first_pane_id" >/dev/null 2>&1 \
+                || true
+        fi
+    elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
+        if [[ -n "$workspace_id" && "$workspace_id" != "unassigned" && "$workspace_id" != hc-* ]]; then
+            herdr-app do space.select --id "$workspace_id" >/dev/null 2>&1 \
+                || ([[ -n "$hc_prefix" && "$workspace_id" != *"/"* ]] && herdr-app do space.select --id "${hc_prefix}${workspace_id}" >/dev/null 2>&1) \
+                || true
+        fi
+        if [[ -n "$tab_id" ]]; then
+            herdr-app do tab.select --id "$tab_id" >/dev/null 2>&1 \
+                || ([[ -n "$hc_prefix" && "$tab_id" != *"/"* ]] && herdr-app do tab.select --id "${hc_prefix}${tab_id}" >/dev/null 2>&1) \
+                || true
+        fi
+        herdr-app do pane.focus --terminal "$target_id" >/dev/null 2>&1 \
+            || herdr-app do agent.focus --terminal "$target_id" >/dev/null 2>&1 \
             || true
     fi
     focus_niri_hc_window
@@ -538,19 +605,24 @@ focus_niri_herdr_window "$machine" "$workspace_label" "1"
 
 if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
     "${herdr_cmd[@]}" workspace focus "$target_id" >/dev/null 2>&1 || true
-    if [[ -n "$workspace_id" ]]; then
-        # Optional 5th arg for workspace focus is tab_id
-        "${herdr_cmd[@]}" tab focus "$workspace_id" >/dev/null 2>&1 || true
+    if [[ -n "$tab_id" ]]; then
+        "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$first_pane_id" ]]; then
+        focus_herdr_pane_rpc "$machine" "$first_pane_id" \
+            || "${herdr_cmd[@]}" agent focus "$first_pane_id" >/dev/null 2>&1 \
+            || true
     fi
 elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
-    if ! "${herdr_cmd[@]}" agent focus "$target_id" >/dev/null 2>&1; then
-        if [[ -n "$workspace_id" ]]; then
-            "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
-        fi
-        if [[ -n "$tab_id" ]]; then
-            "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
-        fi
+    if [[ -n "$workspace_id" ]]; then
+        "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
     fi
+    if [[ -n "$tab_id" ]]; then
+        "${herdr_cmd[@]}" tab focus "$tab_id" >/dev/null 2>&1 || true
+    fi
+    focus_herdr_pane_rpc "$machine" "$target_id" \
+        || "${herdr_cmd[@]}" agent focus "$target_id" >/dev/null 2>&1 \
+        || true
 fi
 
 exit 0
