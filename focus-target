@@ -146,98 +146,65 @@ import time
 target_endpoint = (sys.argv[1] or "").strip().lower()
 client_pids_arg = (sys.argv[2] or "").strip()
 query_text = re.sub(r"[^a-z0-9]+", " ", target_endpoint).strip()
-if not query_text:
+if not query_text or not os.environ.get("WAYLAND_DISPLAY"):
     raise SystemExit(0)
 
-
-def try_kitty_dcs_send_keys():
-    pids = [p for p in client_pids_arg.split() if p.isdigit()]
-    if not pids:
-        try:
-            out = subprocess.check_output(["pgrep", "-x", "herdr"], text=True)
-            pids = [p.strip() for p in out.splitlines() if p.strip().isdigit()]
-        except Exception:
-            pids = []
-
-    for pid in pids:
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                cmd = fh.read().decode("utf-8", "replace").replace("\x00", " ")
-            if "herdr server" in cmd or "remote-client-bridge" in cmd:
+client_pids = [p for p in client_pids_arg.split() if p.isdigit()]
+if not client_pids:
+    try:
+        out = subprocess.check_output(["pgrep", "-x", "herdr"], text=True)
+        for p in out.splitlines():
+            p = p.strip()
+            if not p.isdigit():
                 continue
-        except Exception:
-            continue
-
-        # Check if an ancestor process is kitty
-        cur = pid
-        is_kitty = False
-        for _ in range(12):
-            if not cur or cur in ("0", "1"):
-                break
             try:
-                with open(f"/proc/{cur}/comm", "r", encoding="utf-8") as fh:
-                    comm = fh.read().strip().lower()
-                if comm == "kitty":
-                    is_kitty = True
-                    break
-                with open(f"/proc/{cur}/stat", "r", encoding="utf-8") as fh:
-                    st = fh.read()
-                rparen = st.rfind(")")
-                fields = st[rparen + 2 :].split()
-                cur = fields[1] if len(fields) > 1 else ""
-            except Exception:
-                break
-
-        if not is_kitty:
-            continue
-
-        for fd_num in (0, 1, 2):
-            try:
-                tty_path = os.readlink(f"/proc/{pid}/fd/{fd_num}")
-                if not tty_path.startswith("/dev/pts/"):
-                    continue
-                fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY)
-            except Exception:
-                continue
-
-            try:
-                def send_kitty_key(key_name):
-                    pkt = json.dumps(
-                        {
-                            "cmd": "send-key",
-                            "version": [0, 36, 0],
-                            "no_response": True,
-                            "payload": {"keys": [key_name]},
-                        }
-                    )
-                    os.write(fd, f"\x1bP@kitty-cmd{pkt}\x1b\\".encode("utf-8"))
-
-                send_kitty_key("alt+w")
-                time.sleep(0.08)
-                send_kitty_key("/")
-                time.sleep(0.03)
-                for ch in query_text:
-                    send_kitty_key("space" if ch == " " else ch)
-                    time.sleep(0.012)
-                time.sleep(0.03)
-                send_kitty_key("enter")
-                time.sleep(0.08)
-                return True
+                with open(f"/proc/{p}/cmdline", "rb") as fh:
+                    cmd = fh.read().decode("utf-8", "replace").replace("\x00", " ")
+                if "herdr server" not in cmd and "remote-client-bridge" not in cmd:
+                    client_pids.append(p)
             except Exception:
                 pass
-            finally:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-    return False
+    except Exception:
+        pass
 
 
-if try_kitty_dcs_send_keys():
-    raise SystemExit(0)
+def total_client_wchar():
+    total = 0
+    for pid in client_pids:
+        try:
+            with open(f"/proc/{pid}/io", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("wchar:"):
+                        total += int(line.split()[1])
+                        break
+        except Exception:
+            pass
+    return total
 
-if not os.environ.get("WAYLAND_DISPLAY"):
-    raise SystemExit(0)
+
+def load_goto_bindings():
+    prefix_chord = "ctrl+space"
+    goto_chords = ["prefix+g", "alt+g"]
+    cfg_path = os.path.expanduser("~/.config/herdr/config.toml")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            m_pref = re.search(r'(?m)^\s*prefix\s*=\s*"([^"]+)"', content)
+            if m_pref:
+                prefix_chord = m_pref.group(1).strip().lower()
+            m_goto = re.search(r"(?m)^\s*goto\s*=\s*\[([^\]]+)\]", content)
+            if m_goto:
+                parsed = [
+                    s.strip().strip('"').strip("'").lower()
+                    for s in m_goto.group(1).split(",")
+                    if s.strip().strip('"').strip("'")
+                ]
+                if parsed:
+                    goto_chords = parsed
+        except Exception:
+            pass
+    return prefix_chord, goto_chords
 
 
 class XkbRuleNames(ctypes.Structure):
@@ -359,9 +326,13 @@ def tap(kc, delay=0.004):
 
 
 KEY_ENTER = 28
+KEY_LEFTCTRL = 29
 KEY_LEFTALT = 56
-KEY_W = 17
+KEY_SPACE = 57
+KEY_G = 34
 KEY_SLASH = 53
+KEY_UP = 103
+MOD_CTRL = 4
 MOD_ALT = 8
 
 CHAR_MAP = {
@@ -372,31 +343,101 @@ CHAR_MAP = {
     "7": 8, "8": 9, "9": 10, "0": 11, "-": 12, " ": 57,
 }
 
-# 1. Open workspace_picker (Alt+w) without sending ESC into the active PTY
-send_key(KEY_LEFTALT, 1)
-send_mods(MOD_ALT)
-time.sleep(0.01)
-send_key(KEY_W, 1)
-time.sleep(0.01)
-send_key(KEY_W, 0)
-time.sleep(0.01)
-send_key(KEY_LEFTALT, 0)
-send_mods(0)
-time.sleep(0.06)
 
-# 2. Focus search bar inside workspace_picker ('/')
-tap(KEY_SLASH, 0.008)
+def wait_wchar_delta(w_before, min_delta, timeout_s=0.30):
+    if not client_pids:
+        time.sleep(0.05)
+        return True
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if (total_client_wchar() - w_before) >= min_delta:
+            return True
+        time.sleep(0.015)
+    return (total_client_wchar() - w_before) >= min_delta
+
+
+def send_chord(chord):
+    parts = [p.strip() for p in chord.split("+") if p.strip()]
+    if not parts:
+        return
+    key_name = parts[-1]
+    mods = parts[:-1]
+    kc = KEY_SPACE if key_name == "space" else CHAR_MAP.get(key_name)
+    if kc is None:
+        return
+    mod_mask = 0
+    mod_keys = []
+    if "ctrl" in mods or "control" in mods:
+        mod_mask |= MOD_CTRL
+        mod_keys.append(KEY_LEFTCTRL)
+    if "alt" in mods:
+        mod_mask |= MOD_ALT
+        mod_keys.append(KEY_LEFTALT)
+    for mk in mod_keys:
+        send_key(mk, 1)
+    if mod_mask:
+        send_mods(mod_mask)
+    time.sleep(0.01)
+    send_key(kc, 1)
+    time.sleep(0.01)
+    send_key(kc, 0)
+    time.sleep(0.01)
+    for mk in reversed(mod_keys):
+        send_key(mk, 0)
+    if mod_mask:
+        send_mods(0)
+
+
+prefix_chord, goto_chords = load_goto_bindings()
+direct_chords = [c for c in goto_chords if not c.startswith("prefix+")]
+prefix_suffixes = [c.split("+", 1)[1] for c in goto_chords if c.startswith("prefix+") and "+" in c]
+
+opened_navigator = False
+for dc in direct_chords:
+    w_before = total_client_wchar()
+    send_chord(dc)
+    if wait_wchar_delta(w_before, 150, 0.30):
+        opened_navigator = True
+        break
+
+if not opened_navigator and prefix_suffixes:
+    for suf in prefix_suffixes:
+        w_before = total_client_wchar()
+        send_chord(prefix_chord)
+        time.sleep(0.03)
+        send_chord(suf)
+        if wait_wchar_delta(w_before, 150, 0.30):
+            opened_navigator = True
+            break
+
+if not opened_navigator:
+    s.close()
+    raise SystemExit(0)
+
 time.sleep(0.015)
 
-# 3. Type normalized endpoint query ("local" or profile label) and press Enter
+# 2. Focus search bar inside Navigator overlay ('/') and verify redraw before typing query
+w_before_slash = total_client_wchar()
+tap(KEY_SLASH, 0.008)
+if not wait_wchar_delta(w_before_slash, 10, 0.20):
+    s.close()
+    raise SystemExit(0)
+
+time.sleep(0.01)
+
+# 3. Type normalized endpoint query ("local" or profile label), clamp selection to index 0 (Endpoint row), and press Enter
 for ch in query_text:
     kc = CHAR_MAP.get(ch)
     if kc is not None:
         tap(kc, 0.004)
 
 time.sleep(0.015)
+for _ in range(4):
+    tap(KEY_UP, 0.003)
+
+time.sleep(0.015)
 tap(KEY_ENTER, 0.008)
-time.sleep(0.03)
+time.sleep(0.04)
 s.close()
 PY
 }
@@ -503,6 +544,25 @@ focus_niri_herdr_window() {
                     switch_herdr_tui_endpoint "$desired_endpoint" "$client_pids"
                     HERDR_SWITCHED_ENDPOINT=1
                 fi
+            fi
+
+            if [[ "$HERDR_SWITCHED_ENDPOINT" == "1" ]]; then
+                local poll_i cur_title cur_host
+                for poll_i in {1..15}; do
+                    cur_title="$(
+                        niri msg -j windows 2>/dev/null \
+                            | jq -r --arg wid "$win_id" '.[] | select((.id | tostring) == $wid) | (.title // "")' 2>/dev/null \
+                            | head -n1
+                    )"
+                    cur_host=""
+                    if [[ "$cur_title" == *": "* ]]; then
+                        cur_host="${cur_title%%: *}"
+                    fi
+                    if [[ -n "$cur_host" ]] && endpoint_matches_win_host "$desired_endpoint" "$cur_host" "$local_host"; then
+                        break
+                    fi
+                    sleep 0.04
+                done
             fi
         fi
     fi
