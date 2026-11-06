@@ -54,13 +54,13 @@ wait_niri_window_focus() {
     local win_id="${1:-}"
     [[ -n "$win_id" ]] || return 0
     local i focused_id blocking_layers
-    for i in {1..24}; do
+    for i in {1..30}; do
         blocking_layers="$(
             niri msg -j layers 2>/dev/null | jq -r '
                 [ .[] | select(
                     ((.keyboard_interactivity // "None" | tostring | ascii_downcase) == "exclusive")
                     or (
-                        ((.namespace // "") | (startswith("dms:plugins:") or startswith("dms:popout") or startswith("dms:modal")))
+                        ((.namespace // "") | startswith("dms:"))
                         and ((.keyboard_interactivity // "None" | tostring | ascii_downcase) != "none")
                     )
                 ) ] | length
@@ -128,34 +128,143 @@ PY
 
 switch_herdr_tui_endpoint() {
     local target_endpoint="${1:-}"
+    local client_pids="${2:-}"
     [[ -n "$target_endpoint" ]] || return 0
-    [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 0
 
-    python3 - "$target_endpoint" <<'PY' >/dev/null 2>&1 || true
+    python3 - "$target_endpoint" "$client_pids" <<'PY' >/dev/null 2>&1 || true
 import ctypes
+import json
 import os
 import re
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import time
 
 target_endpoint = (sys.argv[1] or "").strip().lower()
+client_pids_arg = (sys.argv[2] or "").strip()
 query_text = re.sub(r"[^a-z0-9]+", " ", target_endpoint).strip()
 if not query_text:
     raise SystemExit(0)
 
+
+def try_kitty_dcs_send_keys():
+    pids = [p for p in client_pids_arg.split() if p.isdigit()]
+    if not pids:
+        try:
+            out = subprocess.check_output(["pgrep", "-x", "herdr"], text=True)
+            pids = [p.strip() for p in out.splitlines() if p.strip().isdigit()]
+        except Exception:
+            pids = []
+
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmd = fh.read().decode("utf-8", "replace").replace("\x00", " ")
+            if "herdr server" in cmd or "remote-client-bridge" in cmd:
+                continue
+        except Exception:
+            continue
+
+        # Check if an ancestor process is kitty
+        cur = pid
+        is_kitty = False
+        for _ in range(12):
+            if not cur or cur in ("0", "1"):
+                break
+            try:
+                with open(f"/proc/{cur}/comm", "r", encoding="utf-8") as fh:
+                    comm = fh.read().strip().lower()
+                if comm == "kitty":
+                    is_kitty = True
+                    break
+                with open(f"/proc/{cur}/stat", "r", encoding="utf-8") as fh:
+                    st = fh.read()
+                rparen = st.rfind(")")
+                fields = st[rparen + 2 :].split()
+                cur = fields[1] if len(fields) > 1 else ""
+            except Exception:
+                break
+
+        if not is_kitty:
+            continue
+
+        for fd_num in (0, 1, 2):
+            try:
+                tty_path = os.readlink(f"/proc/{pid}/fd/{fd_num}")
+                if not tty_path.startswith("/dev/pts/"):
+                    continue
+                fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY)
+            except Exception:
+                continue
+
+            try:
+                def send_kitty_key(key_name):
+                    pkt = json.dumps(
+                        {
+                            "cmd": "send-key",
+                            "version": [0, 36, 0],
+                            "no_response": True,
+                            "payload": {"keys": [key_name]},
+                        }
+                    )
+                    os.write(fd, f"\x1bP@kitty-cmd{pkt}\x1b\\".encode("utf-8"))
+
+                send_kitty_key("alt+w")
+                time.sleep(0.08)
+                send_kitty_key("/")
+                time.sleep(0.03)
+                for ch in query_text:
+                    send_kitty_key("space" if ch == " " else ch)
+                    time.sleep(0.012)
+                time.sleep(0.03)
+                send_kitty_key("enter")
+                time.sleep(0.08)
+                return True
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+    return False
+
+
+if try_kitty_dcs_send_keys():
+    raise SystemExit(0)
+
+if not os.environ.get("WAYLAND_DISPLAY"):
+    raise SystemExit(0)
+
+
+class XkbRuleNames(ctypes.Structure):
+    _fields_ = [
+        ("rules", ctypes.c_char_p),
+        ("model", ctypes.c_char_p),
+        ("layout", ctypes.c_char_p),
+        ("variant", ctypes.c_char_p),
+        ("options", ctypes.c_char_p),
+    ]
+
+
 libxkb = ctypes.CDLL("libxkbcommon.so.0")
 libxkb.xkb_context_new.argtypes = [ctypes.c_int]
 libxkb.xkb_context_new.restype = ctypes.c_void_p
-libxkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+libxkb.xkb_keymap_new_from_names.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(XkbRuleNames),
+    ctypes.c_int,
+]
 libxkb.xkb_keymap_new_from_names.restype = ctypes.c_void_p
 libxkb.xkb_keymap_get_as_string.argtypes = [ctypes.c_void_p, ctypes.c_int]
 libxkb.xkb_keymap_get_as_string.restype = ctypes.c_char_p
 
 ctx = libxkb.xkb_context_new(0)
-kmap = libxkb.xkb_keymap_new_from_names(ctx, None, 0)
+names = XkbRuleNames(b"evdev", b"pc105", b"us", b"", b"")
+kmap = libxkb.xkb_keymap_new_from_names(ctx, ctypes.byref(names), 0)
 keymap_bytes = libxkb.xkb_keymap_get_as_string(kmap, 1) + b"\x00"
 
 sock_path = os.path.join(
@@ -292,6 +401,24 @@ s.close()
 PY
 }
 
+endpoint_matches_win_host() {
+    local ep="${1,,}"
+    local wh="${2,,}"
+    local lh="${3,,}"
+    [[ -n "$wh" ]] || return 1
+    if [[ "$ep" == "local" ]]; then
+        [[ "$wh" == "$lh" || "$wh" == "local" ]]
+        return $?
+    fi
+    [[ "$wh" == "$lh" || "$wh" == "local" ]] && return 1
+    [[ "$wh" == "$ep" || "$wh" == *"$ep"* || "$ep" == *"$wh"* ]] && return 0
+    if [[ "${#ep}" -ge 3 ]]; then
+        local ep_prefix="${ep:0:3}"
+        [[ "$wh" == *"-${ep_prefix}"* || "$wh" == "${ep_prefix}-"* ]] && return 0
+    fi
+    return 1
+}
+
 focus_niri_herdr_window() {
     local target_machine="${1:-local}"
     local target_ws_label="${2:-}"
@@ -303,10 +430,12 @@ focus_niri_herdr_window() {
     windows_json="$(niri msg -j windows 2>/dev/null)" || return 0
     [[ -n "$windows_json" ]] || return 0
 
+    local local_host
+    local_host="$(hostname 2>/dev/null || echo "local")"
     local desired_endpoint="${target_machine:-local}"
     local target_host="$desired_endpoint"
     if [[ "$desired_endpoint" == "local" ]]; then
-        target_host="$(hostname 2>/dev/null || echo "local")"
+        target_host="$local_host"
     fi
 
     # Collect ancestor PIDs of active herdr TUI client processes (excluding server and remote bridges)
@@ -358,18 +487,20 @@ focus_niri_herdr_window() {
     if [[ -n "$win_id" ]]; then
         wait_niri_window_focus "$win_id"
         if [[ "$allow_switch" == "1" ]]; then
-            local active_endpoint
-            active_endpoint="$(current_herdr_tui_endpoint)"
-            if [[ -n "$active_endpoint" ]]; then
-                if [[ "${active_endpoint,,}" != "${desired_endpoint,,}" ]]; then
-                    switch_herdr_tui_endpoint "$desired_endpoint"
+            local win_host=""
+            if [[ "$win_title" == *": "* ]]; then
+                win_host="${win_title%%: *}"
+            fi
+            if [[ -n "$win_host" ]]; then
+                if ! endpoint_matches_win_host "$desired_endpoint" "$win_host" "$local_host"; then
+                    switch_herdr_tui_endpoint "$desired_endpoint" "$client_pids"
                     HERDR_SWITCHED_ENDPOINT=1
                 fi
             else
-                local win_title_lc="${win_title,,}"
-                local target_host_lc="${target_host,,}"
-                if [[ "$win_title_lc" != "${target_host_lc}: "* ]]; then
-                    switch_herdr_tui_endpoint "$desired_endpoint"
+                local active_endpoint
+                active_endpoint="$(current_herdr_tui_endpoint)"
+                if [[ -n "$active_endpoint" && "${active_endpoint,,}" != "${desired_endpoint,,}" ]]; then
+                    switch_herdr_tui_endpoint "$desired_endpoint" "$client_pids"
                     HERDR_SWITCHED_ENDPOINT=1
                 fi
             fi
@@ -563,7 +694,8 @@ if [[ "$kind" == "reemit-notification" ]]; then
     notif_body="${3:-}"
     command -v notify-send >/dev/null 2>&1 || exit 0
     action="$(
-        timeout 14400 notify-send \
+        timeout 120 notify-send \
+            --expire-time=15000 \
             --app-name="Herdr" \
             --icon="smart_toy" \
             --hint="boolean:suppress-sound:true" \
@@ -650,8 +782,7 @@ focus_herdr_pane() {
 
 focus_herdr_target_on_server() {
     if [[ "$kind" == "workspace" && -n "$target_id" ]]; then
-        # Herdr 0.9.x: select target pane first, then move attached clients via workspace/tab focus
-        if [[ -n "$first_pane_id" ]]; then
+        if [[ -n "$first_pane_id" && ( -z "$machine" || "$machine" == "local" ) ]]; then
             focus_herdr_pane "$machine" "$first_pane_id"
         fi
         "${herdr_cmd[@]}" workspace focus "$target_id" >/dev/null 2>&1 || true
@@ -662,8 +793,9 @@ focus_herdr_target_on_server() {
             focus_herdr_pane "$machine" "$first_pane_id"
         fi
     elif [[ "$kind" == "agent" && -n "$target_id" ]]; then
-        # Herdr 0.9.x: agent/pane focus sets server selection; tab focus moves attached clients and keeps it
-        focus_herdr_pane "$machine" "$target_id"
+        if [[ -z "$machine" || "$machine" == "local" ]]; then
+            focus_herdr_pane "$machine" "$target_id"
+        fi
         if [[ -n "$workspace_id" ]]; then
             "${herdr_cmd[@]}" workspace focus "$workspace_id" >/dev/null 2>&1 || true
         fi
@@ -676,11 +808,9 @@ focus_herdr_target_on_server() {
 
 HERDR_SWITCHED_ENDPOINT=0
 focus_niri_herdr_window "$machine" "$workspace_label" "1"
-focus_herdr_target_on_server
-
 if [[ "$HERDR_SWITCHED_ENDPOINT" == "1" ]]; then
-    sleep 0.35
-    focus_herdr_target_on_server
+    sleep 0.15
 fi
+focus_herdr_target_on_server
 
 exit 0
